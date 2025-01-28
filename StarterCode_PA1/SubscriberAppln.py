@@ -37,47 +37,48 @@ import logging
 from CS6381_MW import SubscriberMW
 from CS6381_MW import discovery_pb2
 from enum import Enum
+from topic_selector import TopicSelector
+
 
 
 class SubscriberAppln():
 
     class State (Enum):
-        INITIALIZE = 0,
-        CONFIGURE = 1,
-        REGISTER = 2,
-        ISREADY = 3,
-        DISSEMINATE = 4,
-        COMPLETED = 5
+        REGISTER = 1
+        ISREADY = 2
+        DISSEMINATE = 3
+        COMPLETED = 4
 
     def __init__ (self, logger):
-        self.state = self.State.INITIALIZE
+        self.logger = logger
+        self.state = None
         self.name = None
         self.topiclist = None
-        self.iters = None
-        self.frequency = None
         self.num_topics = None
+        self.frequency = None
+        self.iters = None
         self.lookup = None
         self.dissemination = None
         self.mw_obj = None
-        self.logger = logger
 
     def configure (self, args):
         try:
             self.logger.info ("SubscriberAppln::configure")
-            self.state = self.State.CONFIGURE
+            self.state = self.State.REGISTER
             self.name = args.name
-            self.iters = args.iters
-            self.frequency = args.frequency
             self.num_topics = args.num_topics
-            config = configparser.ConfigParser ()
-            config.read (args.config)
+            self.frequency = args.frequency
+            self.iters = args.iters
+
+            config = configparser.ConfigParser()
+            config.read(args.config)
             self.lookup = config["Discovery"]["Strategy"]
             self.dissemination = config["Dissemination"]["Strategy"]
-            ts = TopicSelector ()
-            self.topiclist = ts.interest (self.num_topics)
-            self.mw_obj = SubscriberMW (self.logger)
-            self.mw_obj.configure (args)
-            self.logger.info ("SubscriberAppln::configure - configuration complete")
+            ts = TopicSelector()
+            self.topiclist = ts.interest(self.num_topics)
+            self.mw_obj = SubscriberMW(self.logger)
+            self.mw_obj.configure(args)
+            self.logger.info("SubscriberAppln::configure - configuration complete")
         except Exception as e:
             raise e
 
@@ -93,34 +94,33 @@ class SubscriberAppln():
         except Exception as e:
             raise e
 
-    def invoke_operation (self):
+    def invoke_operation(self):
+        ''' Invoke operating depending on state  '''
+
         try:
-            self.logger.info ("SubscriberAppln::invoke_operation")
-            if (self.state == self.State.REGISTER):
-                self.logger.debug ("SubscriberAppln::invoke_operation - register with the discovery service")
-                self.mw_obj.register (self.name, self.topiclist)
+            self.logger.info("SubscriberAppln::invoke_operation")
+            if self.state == self.State.REGISTER:
+                self.logger.debug("SubscriberAppln::invoke_operation - register with the discovery service")
+                self.mw_obj.register(self.name, self.topiclist)
                 return None
-            elif (self.state == self.State.ISREADY):
-                self.logger.debug ("SubscriberAppln::invoke_operation - check if are ready to go")
-                self.mw_obj.is_ready ()
+
+            elif self.state == self.State.ISREADY:
+                self.logger.debug("SubscriberAppln::invoke_operation - check if are ready to go")
+                self.mw_obj.is_ready()
                 return None
-            elif (self.state == self.State.DISSEMINATE):
-                self.logger.debug ("SubscriberAppln::invoke_operation - start Disseminating")
-                ts = TopicSelector ()
-                for i in range (self.iters):
-                    for topic in self.topiclist:
-                        dissemination_data = ts.gen_publication (topic)
-                        self.mw_obj.disseminate (self.name, topic, dissemination_data)
-                    time.sleep (1/float (self.frequency))
-                self.logger.debug ("SubscriberAppln::invoke_operation - Dissemination completed")
-                self.state = self.State.COMPLETED
-                return 0
-            elif (self.state == self.State.COMPLETED):
-                self.mw_obj.disable_event_loop ()
+
+            elif self.state == self.State.DISSEMINATE:
+                self.logger.debug("SubscriberAppln::invoke_operation - waiting for publications")
                 return None
+
+            elif self.state == self.State.COMPLETED:
+                self.mw_obj.disable_event_loop()
+                return None
+
             else:
-                raise ValueError ("Undefined state of the appln object")
-            self.logger.info ("SubscriberAppln::invoke_operation completed")
+                raise ValueError("Undefined state of the appln object")
+            
+            self.logger.info("SubscriberAppln::invoke_operation completed")
         except Exception as e:
             raise e
 
@@ -164,3 +164,39 @@ class SubscriberAppln():
             self.logger.info ("**********************************")
         except Exception as e:
             raise e
+
+def parseCmdLineArgs ():
+    parser = argparse.ArgumentParser (description="Subscriber Application")
+    parser.add_argument ("-n", "--name", default="sub", help="Some name assigned to us. Keep it unique per subscriber")
+    parser.add_argument ("-a", "--addr", default="localhost", help="IP addr of this subscriber to advertise (default: localhost)")
+    parser.add_argument ("-p", "--port", type=int, default=5577, help="Port number on which our underlying subscriber ZMQ service runs, default=5577")
+    parser.add_argument ("-d", "--discovery", default="localhost:5555", help="IP Addr:Port combo for the discovery service, default localhost:5555")
+    parser.add_argument ("-T", "--num_topics", type=int, choices=range(1,10), default=1, help="Number of topics to subscribe, currently restricted to max of 9")
+    parser.add_argument ("-c", "--config", default="config.ini", help="configuration file (default: config.ini)")
+    parser.add_argument ("-f", "--frequency", type=int,default=1, help="Rate at which topics disseminated: default once a second - use integers")
+    parser.add_argument ("-i", "--iters", type=int, default=1000, help="number of publication iterations (default: 1000)")
+    parser.add_argument ("-l", "--loglevel", type=int, default=logging.INFO, choices=[logging.DEBUG,logging.INFO,logging.WARNING,logging.ERROR,logging.CRITICAL], help="logging level, choices 10,20,30,40,50: default 20=logging.INFO")
+    return parser.parse_args()
+
+def main ():
+    try:
+        logging.info ("Main - acquire a child logger and then log messages in the child")
+        logger = logging.getLogger ("SubscriberAppln")
+        logger.debug ("Main: parse command line arguments")
+        args = parseCmdLineArgs ()
+        logger.debug ("Main: resetting log level to {}".format (args.loglevel))
+        logger.setLevel (args.loglevel)
+        logger.debug ("Main: effective log level is {}".format (logger.getEffectiveLevel ()))
+        logger.debug ("Main: obtain the subscriber appln object")
+        sub_app = SubscriberAppln (logger)
+        logger.debug ("Main: configure the subscriber appln object")
+        sub_app.configure (args)
+        logger.debug ("Main: invoke the subscriber appln driver")
+        sub_app.driver ()
+    except Exception as e:
+        logger.error ("Exception caught in main - {}".format (e))
+        return
+
+if __name__ == "__main__":
+    logging.basicConfig (level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    main ()
