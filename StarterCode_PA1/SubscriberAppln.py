@@ -34,7 +34,7 @@ import argparse
 import configparser
 import logging
 
-from CS6381_MW import SubscriberMW
+from CS6381_MW.SubscriberMW import SubscriberMW
 from CS6381_MW import discovery_pb2
 from enum import Enum
 from topic_selector import TopicSelector

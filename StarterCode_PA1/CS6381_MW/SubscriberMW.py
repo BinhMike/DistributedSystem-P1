@@ -56,18 +56,34 @@ class SubscriberMW():
             self.logger.info ("SubscriberMW::configure")
             self.port = args.port
             self.addr = args.addr
+
             self.logger.debug ("SubscriberMW::configure - obtain ZMQ context")
             context = zmq.Context ()
+
             self.logger.debug ("SubscriberMW::configure - obtain the poller")
             self.poller = zmq.Poller ()
+
             self.logger.debug ("SubscriberMW::configure - obtain REQ and SUB sockets")
             self.req = context.socket (zmq.REQ)
             self.sub = context.socket (zmq.SUB)
+            
             self.logger.debug ("SubscriberMW::configure - register the REQ socket for incoming replies")
             self.poller.register (self.req, zmq.POLLIN)
+
             self.logger.debug ("SubscriberMW::configure - connect to Discovery service")
             connect_str = "tcp://" + args.discovery
             self.req.connect (connect_str)
+
+            # Connect to the publisher's addresses
+            pub_addrs = args.pub_addrs  # This should be a list of publisher addresses
+            for pub_addr in pub_addrs:
+                sub_str = "tcp://" + pub_addr
+                self.sub.connect (sub_str)
+
+            # Set subscription topics
+            for topic in args.topiclist:
+                self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
+
             self.logger.info ("SubscriberMW::configure completed")
         except Exception as e:
             raise e
@@ -75,12 +91,15 @@ class SubscriberMW():
     def event_loop (self, timeout=None):
         try:
             self.logger.info ("SubscriberMW::event_loop - run the event loop")
+            self.poller.register(self.sub, zmq.POLLIN)  # Register the SUB socket for incoming messages
             while self.handle_events:
                 events = dict (self.poller.poll (timeout=timeout))
                 if not events:
                     timeout = self.upcall_obj.invoke_operation ()
                 elif self.req in events:
                     timeout = self.handle_reply ()
+                elif self.sub in events:
+                    timeout = self.handle_subscription ()
                 else:
                     raise Exception ("Unknown event after poll")
             self.logger.info ("SubscriberMW::event_loop - out of the event loop")
@@ -100,6 +119,17 @@ class SubscriberMW():
             else:
                 raise ValueError ("Unrecognized response message")
             return timeout
+        except Exception as e:
+            raise e
+
+    def handle_subscription (self):
+        try:
+            self.logger.info ("SubscriberMW::handle_subscription")
+            message = self.sub.recv_string()
+            self.logger.debug(f"Received message: {message}")
+            # Process the message and make an upcall to the application
+            self.upcall_obj.handle_publication(message)
+            return None
         except Exception as e:
             raise e
 
