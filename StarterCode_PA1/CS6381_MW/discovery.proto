@@ -42,8 +42,8 @@ enum MsgTypes {
 // IP addr and port number are needed for publisher side only
 message RegistrantInfo {
     string id = 1;  // name of the entity
-    optional string addr = 2; // IP address (only for publisher)
-    optional uint32 port = 3; // port number (only for publisher)
+    string addr = 2; // IP address (only for publisher)
+    uint32 port = 3; // port number (only for publisher)
 }
 
 // Likewise, instead of just comma separated list of topics, maybe a better way to send the topic list
@@ -60,7 +60,7 @@ message RegisterReq
 message RegisterResp
 {
     Status status = 1;   // success or failure
-    optional string reason = 2; // reason for failure
+    string reason = 2; // reason for failure
 }
 
 // define a message type that publishers might send to a discovery service
