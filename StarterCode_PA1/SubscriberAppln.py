@@ -168,7 +168,7 @@ class SubscriberAppln():
 def parseCmdLineArgs ():
     parser = argparse.ArgumentParser (description="Subscriber Application")
     parser.add_argument ("-n", "--name", default="sub", help="Some name assigned to us. Keep it unique per subscriber")
-    parser.add_argument ("-a", "--addr", default="localhost", help="IP addr of this subscriber to advertise (default: localhost)")
+    parser.add_argument ("-a", "--addr", default="localhost:5577", help="IP addr and port of this subscriber to advertise (default: localhost)")
     parser.add_argument ("-p", "--port", type=int, default=5577, help="Port number on which our underlying subscriber ZMQ service runs, default=5577")
     parser.add_argument ("-d", "--discovery", default="localhost:5555", help="IP Addr:Port combo for the discovery service, default localhost:5555")
     parser.add_argument ("-T", "--num_topics", type=int, choices=range(1,10), default=1, help="Number of topics to subscribe, currently restricted to max of 9")

@@ -54,8 +54,11 @@ class SubscriberMW():
     def configure (self, args):
         try:
             self.logger.info ("SubscriberMW::configure")
-            self.port = args.port
-            self.addr = args.addr
+            
+            # Split the addr argument into IP and port
+            addr_parts = args.addr.split(":")
+            self.addr = addr_parts[0]
+            self.port = int(addr_parts[1])
 
             self.logger.debug ("SubscriberMW::configure - obtain ZMQ context")
             context = zmq.Context ()
@@ -74,15 +77,8 @@ class SubscriberMW():
             connect_str = "tcp://" + args.discovery
             self.req.connect (connect_str)
 
-            # Connect to the publisher's addresses
-            pub_addrs = args.pub_addrs  # This should be a list of publisher addresses
-            for pub_addr in pub_addrs:
-                sub_str = "tcp://" + pub_addr
-                self.sub.connect (sub_str)
-
-            # Set subscription topics
-            for topic in args.topiclist:
-                self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
+            sub_str = "tcp://" + self.addr + ":" + str(self.port)
+            self.sub.connect(sub_str)
 
             self.logger.info ("SubscriberMW::configure completed")
         except Exception as e:

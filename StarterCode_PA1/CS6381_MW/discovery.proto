@@ -9,6 +9,8 @@
 // Let us use the Version 3 syntax
 syntax = "proto3";
 
+package CS6381_MW;
+
 // We will define all the enumeration types we need at the start
 
 // An enumeration for the role we are playing
