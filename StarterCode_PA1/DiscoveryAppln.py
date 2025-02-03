@@ -59,8 +59,10 @@ class DiscoveryAppln:
             # Parse configuration file
             config = configparser.ConfigParser()
             config.read(args.config)
-            self.total_publishers = int(config["Discovery"].get("TotalPublishers", 1))  # Default to 1
-            self.total_subscribers = int(config["Discovery"].get("TotalSubscribers", 1))
+
+            # both default to 1 unless spesified in the command line
+            self.total_publishers = args.pubs
+            self.total_subscribers = args.subs  
 
 
             # Initialize the middleware
@@ -167,6 +169,8 @@ def parseCmdLineArgs():
     parser.add_argument("-p", "--port", type=int, default=5555, help="Port number to run Discovery Service")
     parser.add_argument("-c", "--config", default="config.ini", help="Configuration file (default: config.ini)")
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, choices=[10, 20, 30, 40, 50], help="Logging level")
+    parser.add_argument ("-s", "--subs", type=int, default=1, help="number of needed subscribers to be ready (default: 1)")
+    parser.add_argument ("-P", "--pubs", type=int, default=1, help="number of needed publishers to be ready (default: 1)")
 
     return parser.parse_args()
 
