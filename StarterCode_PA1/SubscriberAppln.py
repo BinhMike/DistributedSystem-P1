@@ -48,7 +48,8 @@ class SubscriberAppln:
         CONFIGURE = 1
         REGISTER = 2
         ISREADY = 3
-        LISTENING = 4  # State where subscriber listens for data
+        LOOKUP = 4
+        LISTENING = 5  # State where subscriber listens for data
 
     def __init__(self, logger):
         self.logger = logger
@@ -116,6 +117,11 @@ class SubscriberAppln:
                 self.logger.debug("SubscriberAppln::invoke_operation - check if ready")
                 self.mw_obj.is_ready()  # Ask Discovery if the system is ready
                 return None  # Wait for response
+            
+            elif self.state == self.State.LOOKUP:
+                self.logger.debug("SubscriberAppln::invoke_operation - lookup publishers")
+                self.mw_obj.lookup_publishers(self.topiclist)
+                return None
 
             elif self.state == self.State.LISTENING:
                 self.logger.debug("SubscriberAppln::invoke_operation - now listening for messages")
@@ -170,6 +176,8 @@ class SubscriberAppln:
     ########################################
     # Handle IsReady Response (Upcall)
     ########################################
+
+    ## TODO 
     def isready_response(self, isready_resp):
         ''' Handle response to is_ready request '''
         try:
@@ -181,15 +189,25 @@ class SubscriberAppln:
                 time.sleep(5)  # Sleep before retrying
             else:
                 # Discovery service is ready
-                self.logger.info("SubscriberAppln::isready_response - Discovery is ready!")
-                self.state = self.State.LISTENING  # Transition to listening for messages
+                self.logger.info("SubscriberAppln::isready_response - Discovery is ready! Transition to LOOKUP state")
+                self.state = self.State.LOOKUP  # Transition to listening for messages
 
             # Return 0 so event loop calls `invoke_operation` again
             return 0
 
         except Exception as e:
             raise e
+    def lookup_response(self, lookup_resp):
+        try:
+            # Connect to discovered publishers
+            for pub in lookup_resp.publishers:
+                pub_address = f"tcp://{pub.addr}:{pub.port}"
+                self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
 
+            # Move to listening state
+            self.state = self.State.LISTENING
+        except Exception as e:
+            raise e
     ########################################
     # Handle Incoming Messages
     ########################################

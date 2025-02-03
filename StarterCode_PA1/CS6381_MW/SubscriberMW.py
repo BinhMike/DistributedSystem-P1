@@ -106,27 +106,25 @@ class SubscriberMW:
     # Handle Discovery Service Replies
     ########################################
     def handle_reply(self):
-        ''' Process replies from Discovery Service '''
         try:
             self.logger.info("SubscriberMW::handle_reply")
-
-            # Receive and deserialize response
+            
+            # Receive response from Discovery
             bytes_received = self.req.recv()
             disc_resp = discovery_pb2.DiscoveryResp()
             disc_resp.ParseFromString(bytes_received)
-
-            # Handle based on message type
+            
             if disc_resp.msg_type == discovery_pb2.TYPE_REGISTER:
                 timeout = self.upcall_obj.register_response(disc_resp.register_resp)
-            elif disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
-                timeout = self.upcall_obj.lookup_response(disc_resp.lookup_resp)
             elif disc_resp.msg_type == discovery_pb2.TYPE_ISREADY:
                 timeout = self.upcall_obj.isready_response(disc_resp.isready_resp)
+            elif disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
+                timeout = self.upcall_obj.lookup_response(disc_resp.lookup_resp)
             else:
-                raise ValueError("Unrecognized response message")
-
+                raise ValueError(f"Unhandled response type: {disc_resp.msg_type}")
+                
             return timeout
-
+                
         except Exception as e:
             raise e
 
@@ -194,6 +192,24 @@ class SubscriberMW:
         except Exception as e:
             raise e
 
+    def lookup_publishers(self, topiclist):
+        try:
+            self.logger.info("SubscriberMW::lookup_publishers")
+            
+            # Create lookup request
+            lookup_req = discovery_pb2.LookupPubByTopicReq()
+            lookup_req.topiclist[:] = topiclist
+            
+            # Create discovery request
+            disc_req = discovery_pb2.DiscoveryReq()
+            disc_req.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
+            disc_req.lookup_req.CopyFrom(lookup_req)
+            
+            # Send request
+            self.req.send(disc_req.SerializeToString())
+            
+        except Exception as e:
+            raise e
 
     ########################################
     # Subscribe to Topics
@@ -221,12 +237,16 @@ class SubscriberMW:
     # Handle Incoming Subscription Messages
     ########################################
     def handle_subscription(self):
-        ''' Process received topic messages '''
         try:
+            self.logger.info("SubscriberMW::handle_subscription")
+            
+            # Receive published message
             message = self.sub.recv_string()
-            topic, data = message.split(":", 1)
-            self.upcall_obj.process_message(topic, data)
-
+            topic, content = message.split(":", 1)
+            
+            # Pass to application layer
+            self.upcall_obj.process_message(topic, content)
+            
         except Exception as e:
             raise e
 
