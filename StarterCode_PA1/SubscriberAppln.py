@@ -206,6 +206,9 @@ class SubscriberAppln:
 
             # Move to listening state
             self.state = self.State.LISTENING
+
+            return 0 # Return 0 to stay in event loop
+        
         except Exception as e:
             raise e
     ########################################
