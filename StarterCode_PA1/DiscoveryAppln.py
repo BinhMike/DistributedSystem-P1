@@ -124,7 +124,7 @@ class DiscoveryAppln:
 
         # Build response
         response = discovery_pb2.DiscoveryResp()
-        response.msg_type = discovery_pb2.TYPE_LOOKUP
+        response.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
         response.lookup_resp.publishers.extend(matched_publishers)
 
         return response
