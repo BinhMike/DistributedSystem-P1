@@ -237,7 +237,7 @@ def parseCmdLineArgs():
     parser.add_argument("-T", "--num_topics", type=int, choices=range(1, 10), default=2, help="Number of topics to subscribe to (1-9)")
     parser.add_argument("-c", "--config", default="config.ini", help="Configuration file (default: config.ini)")
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, choices=[10, 20, 30, 40, 50], help="Logging level")
-
+    parser.add_argument("-p", "--port", type=int, default=6000, help="Subscriber PUB port") 
     return parser.parse_args()
 
 
