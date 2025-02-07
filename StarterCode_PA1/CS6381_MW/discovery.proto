@@ -101,6 +101,7 @@ message LookupPubByTopicResp
      // decide what fields go here. It wil be a list of publishers (with their details)
     // Maybe the RegistrantInfo message can be reused.
     repeated RegistrantInfo publishers = 1; // List of matching publishers
+    RegistrantInfo broker = 2; // broker info (if broker approach is used)
 } 
 
 // Finally, we are going to make a union of all these request and response messages

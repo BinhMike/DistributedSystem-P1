@@ -37,6 +37,7 @@ import sys
 import time
 import logging
 import zmq
+import configparser
 from CS6381_MW import discovery_pb2
 
 class SubscriberMW:
@@ -50,6 +51,11 @@ class SubscriberMW:
         self.poller = None  # Poller for async event handling
         self.upcall_obj = None  # Application logic handle
         self.handle_events = True  # Event loop flag
+        self.topiclist = None
+        # Add config parser
+        self.config = configparser.ConfigParser()
+        self.config.read('config.ini')
+        self.dissemination = self.config['Dissemination']['Strategy']
 
     ########################################
     # Configure Middleware
@@ -119,7 +125,21 @@ class SubscriberMW:
             elif disc_resp.msg_type == discovery_pb2.TYPE_ISREADY:
                 timeout = self.upcall_obj.isready_response(disc_resp.isready_resp)
             elif disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
-                timeout = self.upcall_obj.lookup_response(disc_resp.lookup_resp)
+                publishers = disc_resp.lookup_resp.publishers
+                
+                if self.dissemination == "Direct":
+                    for pub in publishers:
+                        pub_addr = f"tcp://{pub.addr}:{pub.port}"
+                        self.subscribe_to_topics(pub_addr, self.topiclist)
+                else:  # ViaBroker
+                    broker = disc_resp.lookup_resp.broker
+                    if broker and broker.addr and broker.port:
+                        broker_addr = f"tcp://{broker.addr}:{broker.port}"
+                        self.subscribe_to_topics(broker_addr, None)
+                    else:
+                        self.logger.warning("No valid broker information received")
+
+                timeout = None
             else:
                 raise ValueError(f"Unhandled response type: {disc_resp.msg_type}")
                 
@@ -135,6 +155,8 @@ class SubscriberMW:
         ''' Register the subscriber with the Discovery Service '''
         try:
             self.logger.info("SubscriberMW::register")
+            # Store topiclist for later use
+            self.topiclist = topiclist
 
             # Populate registration request
             reg_info = discovery_pb2.RegistrantInfo()
@@ -223,9 +245,13 @@ class SubscriberMW:
             self.sub.connect(pub_address)
 
             # Subscribe to topics
-            for topic in topiclist:
-                self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
-                self.logger.info(f"Subscribed to topic: {topic}")
+            if not topiclist:  # Broker part
+                self.sub.setsockopt_string(zmq.SUBSCRIBE, "")
+                self.logger.info(f"SubscriberMW::subscribe_to_topics - Connected to Broker, subscribing to all topics")
+            else: # publisher
+                for topic in topiclist:
+                    self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
+                    self.logger.info(f"Subscribed to topic: {topic}")
 
             # Register the SUB socket with poller
             self.poller.register(self.sub, zmq.POLLIN)

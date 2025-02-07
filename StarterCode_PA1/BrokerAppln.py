@@ -21,6 +21,7 @@ import sys
 import time
 import argparse
 import logging
+import signal
 from CS6381_MW.BrokerMW import BrokerMW  
 from CS6381_MW import discovery_pb2  
 
@@ -34,7 +35,8 @@ class BrokerAppln():
         self.logger = logger
         self.mw_obj = None  
         self.state = "REGISTER"  
-        self.name = None  
+        self.name = None
+        signal.signal(signal.SIGINT, self.signal_handler)
 
     def configure(self, args):
         self.logger.info("BrokerAppln::configure")
@@ -48,9 +50,16 @@ class BrokerAppln():
         try:
             self.logger.info("BrokerAppln::driver - starting event loop")
             self.mw_obj.set_upcall_handle(self)
+            self.invoke_operation()
             self.mw_obj.event_loop(timeout=0)  # enter event loop
         except Exception as e:
-            raise e
+            self.logger.error(f"BrokerAppln::driver - error: {str(e)}")
+            self.cleanup()
+
+    def register(self):
+        ''' Register to the discovery server '''
+        self.logger.info("BrokerAppln::register - Registering with Discovery Server")
+        self.mw_obj.register(self.name)
 
     def invoke_operation(self):
         ''' Invoke operating depending on state  '''
@@ -59,7 +68,7 @@ class BrokerAppln():
             # check state
             if self.state == "REGISTER": # 
                 self.logger.debug("BrokerAppln::invoke_operation - registering with Discovery")
-                self.mw_obj.register(self.name)
+                self.register()
                 return None
             elif self.state == "DISPATCH":
                 self.logger.debug("BrokerAppln::invoke_operation - dispatching messages")
@@ -77,6 +86,17 @@ class BrokerAppln():
         else:
             raise ValueError("Broker registration failed")
 
+    def signal_handler(self, signum, frame):
+        """ Handle shutdown when interrupt signal is received """
+        self.logger.info(f"BrokerAppln::signal_handler - received signal {signum}")
+        self.cleanup()
+        sys.exit(0)
+
+    def cleanup(self):
+        """ Cleanup the middleware """
+        self.logger.info("BrokerAppln::cleanup")
+        if self.mw_obj:
+            self.mw_obj.cleanup()
 
 
 def parseCmdLineArgs():
@@ -87,10 +107,9 @@ def parseCmdLineArgs():
     parser.add_argument("-d", "--discovery", default="localhost:5555", help="Discovery Service IP:Port")
     parser.add_argument("--publisher_ip", default="localhost", help="Publisher IP Address") # Publisher ip. Publisher send message to broker
     parser.add_argument("--publisher_port", type=int, default=6001, help="Publisher Port")
-
+    parser.add_argument("--addr", default="localhost", help="Broker's advertised address") 
     return parser.parse_args()
     
-
 ###################################
 #
 # Main program
