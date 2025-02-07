@@ -59,8 +59,10 @@ class DiscoveryAppln:
             # Parse configuration file
             config = configparser.ConfigParser()
             config.read(args.config)
-            self.total_publishers = int(config["Discovery"].get("TotalPublishers", 1))  # Default to 1
-            self.total_subscribers = int(config["Discovery"].get("TotalSubscribers", 1))
+
+            # both default to 1 unless spesified in the command line
+            self.total_publishers = args.pubs
+            self.total_subscribers = args.subs  
 
 
             # Initialize the middleware
@@ -101,6 +103,10 @@ class DiscoveryAppln:
         response.msg_type = discovery_pb2.TYPE_REGISTER
         response.register_resp.status = discovery_pb2.STATUS_SUCCESS
 
+
+        # DEBUG
+        self.logger.info("response: %s", response)
+
         return response
 
     ########################################
@@ -121,7 +127,9 @@ class DiscoveryAppln:
 
         # Build response
         response = discovery_pb2.DiscoveryResp()
-        response.msg_type = discovery_pb2.TYPE_LOOKUP
+
+        response.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
+
         response.lookup_resp.publishers.extend(matched_publishers)
 
         return response
@@ -137,6 +145,12 @@ class DiscoveryAppln:
         response = discovery_pb2.DiscoveryResp()
         response.msg_type = discovery_pb2.TYPE_ISREADY
         response.isready_resp.status = ready
+
+        # DEBUG
+        self.logger.info(f"DiscoveryAppln::is_ready - Publishers registered: {len(self.registry['publishers'])}/{self.total_publishers}")
+        self.logger.info(f"DiscoveryAppln::is_ready - Subscribers registered: {len(self.registry['subscribers'])}/{self.total_subscribers}")
+        self.logger.info(f"DiscoveryAppln::is_ready - System Ready? {ready}")
+
 
         return response
 
@@ -158,6 +172,9 @@ def parseCmdLineArgs():
     parser.add_argument("-p", "--port", type=int, default=5555, help="Port number to run Discovery Service")
     parser.add_argument("-c", "--config", default="config.ini", help="Configuration file (default: config.ini)")
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, choices=[10, 20, 30, 40, 50], help="Logging level")
+    parser.add_argument ("-s", "--subs", type=int, default=1, help="number of needed subscribers to be ready (default: 1)")
+    parser.add_argument ("-P", "--pubs", type=int, default=1, help="number of needed publishers to be ready (default: 1)")
+
 
     return parser.parse_args()
 

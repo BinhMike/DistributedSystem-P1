@@ -229,7 +229,7 @@ class PublisherAppln ():
 
         # We are here because both registration and is ready is done. So the only thing
         # left for us as a publisher is dissemination, which we do it actively here.
-        self.logger.debug ("PublisherAppln::invoke_operation - start Disseminating")
+        self.logger.info ("PublisherAppln::invoke_operation - start Disseminating")
 
         # Now disseminate topics at the rate at which we have configured ourselves.
         ts = TopicSelector ()
@@ -249,7 +249,7 @@ class PublisherAppln ():
           # frequency that was configured.
           time.sleep (1/float (self.frequency))  # ensure we get a floating point num
 
-        self.logger.debug ("PublisherAppln::invoke_operation - Dissemination completed")
+        self.logger.info ("PublisherAppln::invoke_operation - Dissemination completed")
 
         # we are done. So we move to the completed state
         self.state = self.State.COMPLETED
@@ -323,7 +323,12 @@ class PublisherAppln ():
       else:
         # we got the go ahead
         # set the state to disseminate
+        # DEBUG
+        self.logger.info("PublisherAppln::isready_response - System is ready, change State to DISSEMINATE")
+
         self.state = self.State.DISSEMINATE
+
+        self.logger.info(f"PublisherAppln::isready_response - New state: {self.state}")
         
       # return timeout of 0 so event loop calls us back in the invoke_operation
       # method, where we take action based on what state we are in.

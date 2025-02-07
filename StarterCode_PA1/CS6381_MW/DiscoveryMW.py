@@ -72,7 +72,7 @@ class DiscoveryMW:
                 # Determine message type and handle accordingly
                 if disc_req.msg_type == discovery_pb2.TYPE_REGISTER:
                     response = self.upcall_obj.register(disc_req.register_req)
-                elif disc_req.msg_type == discovery_pb2.TYPE_LOOKUP:
+                elif disc_req.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
                     response = self.upcall_obj.lookup(disc_req.lookup_req)
                 elif disc_req.msg_type == discovery_pb2.TYPE_ISREADY:
                     response = self.upcall_obj.is_ready()
