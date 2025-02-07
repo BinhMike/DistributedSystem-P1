@@ -33,7 +33,9 @@ import sys
 import time
 import argparse
 import logging
+
 import configparser
+
 from CS6381_MW.SubscriberMW import SubscriberMW
 from CS6381_MW import discovery_pb2
 from topic_selector import TopicSelector  # Import TopicSelector
@@ -226,6 +228,7 @@ class SubscriberAppln:
         self.register()
         self.mw_obj.event_loop()
 
+
 ###################################
 # Parse command line arguments
 ###################################
@@ -238,6 +241,7 @@ def parseCmdLineArgs():
     parser.add_argument("-c", "--config", default="config.ini", help="Configuration file (default: config.ini)")
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, choices=[10, 20, 30, 40, 50], help="Logging level")
     parser.add_argument("-p", "--port", type=int, default=6000, help="Subscriber PUB port") 
+
     return parser.parse_args()
 
 

@@ -103,6 +103,7 @@ class DiscoveryAppln:
         response.msg_type = discovery_pb2.TYPE_REGISTER
         response.register_resp.status = discovery_pb2.STATUS_SUCCESS
 
+
         # DEBUG
         self.logger.info("response: %s", response)
 
@@ -126,7 +127,9 @@ class DiscoveryAppln:
 
         # Build response
         response = discovery_pb2.DiscoveryResp()
+
         response.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
+
         response.lookup_resp.publishers.extend(matched_publishers)
 
         return response
@@ -171,6 +174,7 @@ def parseCmdLineArgs():
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, choices=[10, 20, 30, 40, 50], help="Logging level")
     parser.add_argument ("-s", "--subs", type=int, default=1, help="number of needed subscribers to be ready (default: 1)")
     parser.add_argument ("-P", "--pubs", type=int, default=1, help="number of needed publishers to be ready (default: 1)")
+
 
     return parser.parse_args()
 
