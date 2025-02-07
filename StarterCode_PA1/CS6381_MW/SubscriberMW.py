@@ -119,7 +119,27 @@ class SubscriberMW:
             elif disc_resp.msg_type == discovery_pb2.TYPE_ISREADY:
                 timeout = self.upcall_obj.isready_response(disc_resp.isready_resp)
             elif disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
-                timeout = self.upcall_obj.lookup_response(disc_resp.lookup_resp)
+                # 处理 Publisher 或 Broker 查找响应
+                publishers = disc_resp.lookup_resp.publishers
+
+                if len(publishers) > 0:
+                    # 如果有 Publisher，直接连接 Publisher
+                    self.logger.info(f"SubscriberMW::handle_reply - Found Publishers, connecting to {publishers}")
+                    for pub in publishers:
+                        pub_addr = f"tcp://{pub.addr}:{pub.port}"
+                        self.subscribe_to_topics(pub_addr, self.topiclist)
+                else:
+                    # 如果没有 Publisher，尝试连接 Broker
+                    brokers = self.registry.get("brokers", {})
+                    if len(brokers) > 0:
+                        broker_info = list(brokers.values())[0]  # 选择一个 Broker
+                        broker_addr = f"tcp://{broker_info['addr']}:{broker_info['port']}"
+                        self.logger.info(f"SubscriberMW::handle_reply - No publishers found, connecting to Broker {broker_addr}")
+                        self.subscribe_to_topics(broker_addr, self.topiclist)
+                    else:
+                        self.logger.warning("SubscriberMW::handle_reply - No publishers or brokers found, retrying later")
+
+                timeout = None  # 继续监听
             else:
                 raise ValueError(f"Unhandled response type: {disc_resp.msg_type}")
                 
@@ -223,9 +243,13 @@ class SubscriberMW:
             self.sub.connect(pub_address)
 
             # Subscribe to topics
-            for topic in topiclist:
-                self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
-                self.logger.info(f"Subscribed to topic: {topic}")
+            if not topiclist:  # Broker part
+                self.sub.setsockopt_string(zmq.SUBSCRIBE, "")
+                self.logger.info(f"SubscriberMW::subscribe_to_topics - Connected to Broker, subscribing to all topics")
+            else: # publisher
+                for topic in topiclist:
+                    self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
+                    self.logger.info(f"Subscribed to topic: {topic}")
 
             # Register the SUB socket with poller
             self.poller.register(self.sub, zmq.POLLIN)
