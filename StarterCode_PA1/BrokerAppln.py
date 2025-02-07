@@ -34,7 +34,8 @@ class BrokerAppln():
         self.logger = logger
         self.mw_obj = None  
         self.state = "REGISTER"  
-        self.name = None  
+        self.name = None
+        signal.signal(signal.SIGINT, self.signal_handler)
 
     def configure(self, args):
         self.logger.info("BrokerAppln::configure")
@@ -51,7 +52,8 @@ class BrokerAppln():
             self.invoke_operation()
             self.mw_obj.event_loop(timeout=0)  # enter event loop
         except Exception as e:
-            raise e
+            self.logger.error(f"BrokerAppln::driver - error: {str(e)}")
+            self.cleanup()
 
     def register(self):
         ''' Register to the discovery server '''
@@ -96,6 +98,19 @@ def parseCmdLineArgs():
     parser.add_argument("--addr", default="localhost", help="Broker's advertised address") 
     return parser.parse_args()
     
+def handle_interrupt(signal, frame):
+    """ Handle Ctrl+C """
+    self.logger.info("BrokerAppln::handle_interrupt - received interrupt")
+    self.cleanup()
+    exit(0)
+
+def cleanup(self):
+    """ Cleanup for graceful shutdown """
+    try:
+        self.logger.info("BrokerAppln::cleanup")
+        self.mw_obj.cleanup()
+    except Exception as e:
+        self.logger.error(f"BrokerAppln::cleanup - error: {str(e)}")
 
 ###################################
 #

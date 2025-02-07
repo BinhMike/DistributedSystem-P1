@@ -29,8 +29,14 @@ class BrokerMW():
     def __init__(self, logger):
         self.logger = logger
         self.context = zmq.Context()
-        self.sub = None  
-        self.pub = None  
+        self.sub = None
+        self.pub = None
+        self.req = None
+        self.poller = None
+        self.upcall_obj = None
+        self.handle_events = True
+        self.addr = None
+        self.port = None
 
     def configure(self, args):
         self.addr = args.addr  
@@ -91,13 +97,85 @@ class BrokerMW():
 
 
     def forward_messages(self):
-        ''' Listening from Publisher and forward to Subscriber '''
-        while True:
-            message = self.sub.recv_string() # read message from publisher
-            self.logger.info(f"BrokerMW::forward_messages - Forwarding message: {message}")
-            self.pub.send_string(message)  # dispatch message to subscriber
-
+        ''' Forward messages with error handling '''
+        try:
+            # Receive message from publisher
+            message = self.sub.recv_string(flags=zmq.NOBLOCK)
+            if message:
+                # Log and forward message
+                self.logger.debug(f"BrokerMW::forward_messages - received: {message}")
+                self.pub.send_string(message)
+                return True
+                
+        except zmq.ZMQError as e:
+            if e.errno == zmq.EAGAIN:
+                # No message available
+                pass
+            else:
+                self.logger.error(f"BrokerMW::forward_messages - ZMQ error: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"BrokerMW::forward_messages - error: {str(e)}")
+            
+        return False
     def event_loop(self, timeout=None):
-        self.logger.info("BrokerMW::event_loop - running")
-        while True:
-            self.forward_messages()
+        ''' Improved event loop with ZMQ Poller '''
+        try:
+            self.logger.info("BrokerMW::event_loop")
+            
+            # Create poller for multiple sockets
+            self.poller = zmq.Poller()
+            self.poller.register(self.sub, zmq.POLLIN)
+            self.poller.register(self.req, zmq.POLLIN)
+            
+            while True:
+                # Poll for events with timeout
+                events = dict(self.poller.poll(timeout=timeout))
+                
+                if not events:
+                    # No events, let application handle timeout
+                    timeout = self.upcall_obj.invoke_operation()
+                elif self.req in events:
+                    # Handle discovery service responses
+                    timeout = self.handle_reply()
+                elif self.sub in events:
+                    # Handle publisher messages
+                    self.forward_messages()
+                    
+        except Exception as e:
+            self.logger.error(f"BrokerMW::event_loop - error: {str(e)}")
+            raise e
+
+    def handle_reply(self):
+        ''' Handle discovery service responses '''
+        try:
+            # Receive and parse response
+            response = self.req.recv()
+            disc_resp = discovery_pb2.DiscoveryResp()
+            disc_resp.ParseFromString(response)
+            
+            if disc_resp.msg_type == discovery_pb2.TYPE_REGISTER:
+                timeout = self.upcall_obj.register_response(disc_resp.register_resp)
+            else:
+                self.logger.warning(f"Unhandled response type: {disc_resp.msg_type}")
+                timeout = None
+                
+            return timeout
+            
+        except Exception as e:
+            self.logger.error(f"BrokerMW::handle_reply - error: {str(e)}")
+            raise e
+        
+    def cleanup(self):
+        ''' Clean shutdown of sockets '''
+        try:
+            if self.sub:
+                self.poller.unregister(self.sub)
+                self.sub.close()
+            if self.pub:
+                self.pub.close()
+            if self.req:
+                self.poller.unregister(self.req)
+                self.req.close()
+            self.context.term()
+        except Exception as e:
+            self.logger.error(f"BrokerMW::cleanup - error: {str(e)}")
