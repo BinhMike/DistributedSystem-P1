@@ -23,6 +23,7 @@
 import zmq
 import logging
 import time
+from CS6381_MW import discovery_pb2  
 
 class BrokerMW():
     def __init__(self, logger):
@@ -32,6 +33,8 @@ class BrokerMW():
         self.pub = None  
 
     def configure(self, args):
+        self.addr = args.addr  
+        self.port = args.port
         self.logger.info("BrokerMW::configure")
         self.sub = self.context.socket(zmq.SUB) # Set sub
         self.pub = self.context.socket(zmq.PUB) # Set pub
@@ -42,6 +45,44 @@ class BrokerMW():
 
         self.logger.debug("BrokerMW::configure - binding PUB socket")
         self.pub.bind(f"tcp://*:{args.port}")
+
+        #req-rep
+        self.req = self.context.socket(zmq.REQ)
+        self.logger.debug("BrokerMW::configure - connecting to Discovery Service")
+        self.req.connect(f"tcp://{args.discovery}")
+
+    def register(self, name):
+        ''' Send registration requirment to Discovery Server '''
+        self.logger.info(f"BrokerMW::register - Registering Broker: {name}")
+        # Construct registrantInfo
+        reg_info = discovery_pb2.RegistrantInfo()
+        reg_info.id = name
+        reg_info.addr = self.addr  
+        reg_info.port = self.port 
+
+        # construct RegisterReq
+        register_req = discovery_pb2.RegisterReq()
+        register_req.role = discovery_pb2.ROLE_BOTH  # Broker type
+        register_req.info.CopyFrom(reg_info) 
+
+        # construct DiscoveryReq
+        disc_req = discovery_pb2.DiscoveryReq()
+        disc_req.msg_type = discovery_pb2.TYPE_REGISTER
+        disc_req.register_req.CopyFrom(register_req)
+
+        # Send registration message
+        buf = register_req.SerializeToString()
+        self.logger.debug(f"BrokerMW::register - Sending registration request: {buf}")
+        self.req.send(buf)
+
+        # wait for response
+        response = self.req.recv()
+        # parse response
+        reg_resp = discovery_pb2.RegisterResp()
+        reg_resp.ParseFromString(response) 
+        self.logger.debug(f"BrokerMW::register - Received response: {reg_resp.status}")
+        return reg_resp.register_resp
+
 
 
     def set_upcall_handle(self, upcall_obj): # upcall function same as in Publisher

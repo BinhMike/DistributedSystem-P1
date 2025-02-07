@@ -46,7 +46,7 @@ class DiscoveryAppln:
         self.mw_obj = None  # Middleware handle
         self.total_publishers = None
         self.total_subscribers = None
-        self.registry = {"publishers": {}, "subscribers": {}}  # Store registered entities
+        self.registry = {"publishers": {}, "subscribers": {}, "brokers":{}}  # Store registered entities
 
     ########################################
     # Configure Discovery Application
@@ -81,7 +81,13 @@ class DiscoveryAppln:
     ########################################
     def register(self, register_req):
         ''' Handle publisher/subscriber registration '''
-        role = "Publisher" if register_req.role == discovery_pb2.ROLE_PUBLISHER else "Subscriber"
+        role_map = {
+            discovery_pb2.ROLE_PUBLISHER: "Publisher",
+            discovery_pb2.ROLE_SUBSCRIBER: "Subscriber",
+            discovery_pb2.ROLE_BOTH: "Broker"
+        }
+    
+        role = role_map.get(register_req.role, "Unknown")
         self.logger.info(f"Registering {role}: {register_req.info.id}")
 
         # Store registration details
@@ -91,12 +97,30 @@ class DiscoveryAppln:
                 "port": register_req.info.port,
                 "topics": list(register_req.topiclist)
             }
-        else:
+        elif register_req.role == discovery_pb2.ROLE_SUBSCRIBER:
             self.registry["subscribers"][register_req.info.id] = {
                 "addr": register_req.info.addr,
                 "port": register_req.info.port,
                 "topics": list(register_req.topiclist)
             }
+        elif register_req.role == discovery_pb2.ROLE_BOTH:  # Broker 
+            self.registry["brokers"][register_req.info.id] = {
+                "addr": register_req.info.addr,
+                "port": register_req.info.port
+            }
+        # Debug
+        self.logger.debug(f"DiscoveryMW::register - Current state: "
+                      f"Publishers: {len(self.registry['publishers'])}, "
+                      f"Subscribers: {len(self.registry['subscribers'])}, "
+                      f"Brokers: {len(self.registry.get('brokers', {}))}")
+
+        # Debug
+        if not self.is_ready():
+            self.logger.warning(f"DiscoveryMW::register - System not ready yet, returning STATUS_CHECK_AGAIN")
+            response = discovery_pb2.DiscoveryResp()
+            response.msg_type = discovery_pb2.TYPE_REGISTER
+            response.register_resp.status = discovery_pb2.STATUS_CHECK_AGAIN
+            return response
 
         # Build response
         response = discovery_pb2.DiscoveryResp()
@@ -136,9 +160,16 @@ class DiscoveryAppln:
     ########################################
     def is_ready(self):
         ''' Check if all publishers and subscribers have registered '''
-        ready = (len(self.registry["publishers"]) == self.total_publishers) and \
-                (len(self.registry["subscribers"]) == self.total_subscribers)
-        
+        num_pubs = len(self.registry["publishers"])  # num of all publishers
+        num_subs = len(self.registry["subscribers"])  # num of all subscribers
+        num_brokers = len(self.registry.get("brokers", {}))  # num of broker(can be 0)
+
+        # Direct Mode
+        ready = (num_pubs >= self.total_publishers) and (num_subs >= self.total_subscribers)
+        # ViaBroker Mode(only need broker and subscribers)
+        if num_brokers > 0 and num_subs >= self.total_subscribers:
+            ready = True  
+            
         response = discovery_pb2.DiscoveryResp()
         response.msg_type = discovery_pb2.TYPE_ISREADY
         response.isready_resp.status = ready

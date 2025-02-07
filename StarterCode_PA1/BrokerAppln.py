@@ -48,9 +48,15 @@ class BrokerAppln():
         try:
             self.logger.info("BrokerAppln::driver - starting event loop")
             self.mw_obj.set_upcall_handle(self)
+            self.invoke_operation()
             self.mw_obj.event_loop(timeout=0)  # enter event loop
         except Exception as e:
             raise e
+
+    def register(self):
+        ''' Register to the discovery server '''
+        self.logger.info("BrokerAppln::register - Registering with Discovery Server")
+        self.mw_obj.register(self.name)
 
     def invoke_operation(self):
         ''' Invoke operating depending on state  '''
@@ -59,7 +65,7 @@ class BrokerAppln():
             # check state
             if self.state == "REGISTER": # 
                 self.logger.debug("BrokerAppln::invoke_operation - registering with Discovery")
-                self.mw_obj.register(self.name)
+                self.register()
                 return None
             elif self.state == "DISPATCH":
                 self.logger.debug("BrokerAppln::invoke_operation - dispatching messages")
@@ -87,7 +93,7 @@ def parseCmdLineArgs():
     parser.add_argument("-d", "--discovery", default="localhost:5555", help="Discovery Service IP:Port")
     parser.add_argument("--publisher_ip", default="localhost", help="Publisher IP Address") # Publisher ip. Publisher send message to broker
     parser.add_argument("--publisher_port", type=int, default=6001, help="Publisher Port")
-
+    parser.add_argument("--addr", default="localhost", help="Broker's advertised address") 
     return parser.parse_args()
     
 
