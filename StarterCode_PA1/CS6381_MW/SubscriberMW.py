@@ -37,6 +37,7 @@ import sys
 import time
 import logging
 import zmq
+import configparser
 from CS6381_MW import discovery_pb2
 
 class SubscriberMW:
@@ -50,6 +51,11 @@ class SubscriberMW:
         self.poller = None  # Poller for async event handling
         self.upcall_obj = None  # Application logic handle
         self.handle_events = True  # Event loop flag
+        self.topiclist = None
+        # Add config parser
+        self.config = configparser.ConfigParser()
+        self.config.read('config.ini')
+        self.dissemination = self.config['Dissemination']['Strategy']
 
     ########################################
     # Configure Middleware
@@ -119,27 +125,21 @@ class SubscriberMW:
             elif disc_resp.msg_type == discovery_pb2.TYPE_ISREADY:
                 timeout = self.upcall_obj.isready_response(disc_resp.isready_resp)
             elif disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
-                # 处理 Publisher 或 Broker 查找响应
                 publishers = disc_resp.lookup_resp.publishers
-
-                if len(publishers) > 0:
-                    # 如果有 Publisher，直接连接 Publisher
-                    self.logger.info(f"SubscriberMW::handle_reply - Found Publishers, connecting to {publishers}")
+                
+                if self.dissemination == "Direct":
                     for pub in publishers:
                         pub_addr = f"tcp://{pub.addr}:{pub.port}"
                         self.subscribe_to_topics(pub_addr, self.topiclist)
-                else:
-                    # 如果没有 Publisher，尝试连接 Broker
-                    brokers = self.registry.get("brokers", {})
-                    if len(brokers) > 0:
-                        broker_info = list(brokers.values())[0]  # 选择一个 Broker
-                        broker_addr = f"tcp://{broker_info['addr']}:{broker_info['port']}"
-                        self.logger.info(f"SubscriberMW::handle_reply - No publishers found, connecting to Broker {broker_addr}")
-                        self.subscribe_to_topics(broker_addr, self.topiclist)
+                else:  # ViaBroker
+                    broker = disc_resp.lookup_resp.broker
+                    if broker and broker.addr and broker.port:
+                        broker_addr = f"tcp://{broker.addr}:{broker.port}"
+                        self.subscribe_to_topics(broker_addr, None)
                     else:
-                        self.logger.warning("SubscriberMW::handle_reply - No publishers or brokers found, retrying later")
+                        self.logger.warning("No valid broker information received")
 
-                timeout = None  # 继续监听
+                timeout = None
             else:
                 raise ValueError(f"Unhandled response type: {disc_resp.msg_type}")
                 
@@ -155,6 +155,8 @@ class SubscriberMW:
         ''' Register the subscriber with the Discovery Service '''
         try:
             self.logger.info("SubscriberMW::register")
+            # Store topiclist for later use
+            self.topiclist = topiclist
 
             # Populate registration request
             reg_info = discovery_pb2.RegistrantInfo()

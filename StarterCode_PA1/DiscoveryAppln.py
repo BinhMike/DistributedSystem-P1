@@ -139,20 +139,47 @@ class DiscoveryAppln:
         ''' Handle subscriber lookup request '''
         self.logger.info(f"Lookup request for topics: {lookup_req.topiclist}")
 
-        matched_publishers = []
-        for pub_id, pub_data in self.registry["publishers"].items():
-            if any(topic in pub_data["topics"] for topic in lookup_req.topiclist):
-                pub_info = discovery_pb2.RegistrantInfo()
-                pub_info.id = pub_id
-                pub_info.addr = pub_data["addr"]
-                pub_info.port = pub_data["port"]
-                matched_publishers.append(pub_info)
-
-        # Build response
+        # Create response
         response = discovery_pb2.DiscoveryResp()
         response.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
-        response.lookup_resp.publishers.extend(matched_publishers)
+        
+        # Initialize lookup response
+        lookup_resp = discovery_pb2.LookupPubByTopicResp()
 
+        # Get configuration
+        config = configparser.ConfigParser()
+        config.read("config.ini")
+        dissemination_strategy = config["Dissemination"]["Strategy"]
+
+        if dissemination_strategy == "ViaBroker":
+            # Return broker info if we have one registered
+            if self.registry.get("brokers"):
+                broker_id = next(iter(self.registry["brokers"]))  # Get first broker
+                broker_info = self.registry["brokers"][broker_id]
+                
+                broker = discovery_pb2.RegistrantInfo()
+                broker.id = broker_id
+                broker.addr = broker_info["addr"]
+                broker.port = broker_info["port"]
+                
+                lookup_resp.broker.CopyFrom(broker)  # Use lookup_resp instead
+        else:
+            # Return matching publishers for direct strategy
+            matched_publishers = []
+            for pub_id, pub_data in self.registry["publishers"].items():
+                if any(topic in pub_data["topics"] for topic in lookup_req.topiclist):
+                    pub_info = discovery_pb2.RegistrantInfo()
+                    pub_info.id = pub_id
+                    pub_info.addr = pub_data["addr"]
+                    pub_info.port = pub_data["port"]
+                    matched_publishers.append(pub_info)
+            
+            lookup_resp.publishers.extend(matched_publishers)
+
+        # Copy the lookup response into the discovery response
+        response.lookup_resp.CopyFrom(lookup_resp)
+        
+        self.logger.debug(f"DiscoveryAppln::lookup - Response prepared: {response}")
         return response
 
     ########################################

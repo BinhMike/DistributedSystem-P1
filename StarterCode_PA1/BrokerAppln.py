@@ -21,6 +21,7 @@ import sys
 import time
 import argparse
 import logging
+import signal
 from CS6381_MW.BrokerMW import BrokerMW  
 from CS6381_MW import discovery_pb2  
 
@@ -85,6 +86,17 @@ class BrokerAppln():
         else:
             raise ValueError("Broker registration failed")
 
+    def signal_handler(self, signum, frame):
+        """ Handle shutdown when interrupt signal is received """
+        self.logger.info(f"BrokerAppln::signal_handler - received signal {signum}")
+        self.cleanup()
+        sys.exit(0)
+
+    def cleanup(self):
+        """ Cleanup the middleware """
+        self.logger.info("BrokerAppln::cleanup")
+        if self.mw_obj:
+            self.mw_obj.cleanup()
 
 
 def parseCmdLineArgs():
@@ -98,20 +110,6 @@ def parseCmdLineArgs():
     parser.add_argument("--addr", default="localhost", help="Broker's advertised address") 
     return parser.parse_args()
     
-def handle_interrupt(signal, frame):
-    """ Handle Ctrl+C """
-    self.logger.info("BrokerAppln::handle_interrupt - received interrupt")
-    self.cleanup()
-    exit(0)
-
-def cleanup(self):
-    """ Cleanup for graceful shutdown """
-    try:
-        self.logger.info("BrokerAppln::cleanup")
-        self.mw_obj.cleanup()
-    except Exception as e:
-        self.logger.error(f"BrokerAppln::cleanup - error: {str(e)}")
-
 ###################################
 #
 # Main program

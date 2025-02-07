@@ -60,6 +60,7 @@ class BrokerMW():
     def register(self, name):
         ''' Send registration requirment to Discovery Server '''
         self.logger.info(f"BrokerMW::register - Registering Broker: {name}")
+        
         # Construct registrantInfo
         reg_info = discovery_pb2.RegistrantInfo()
         reg_info.id = name
@@ -76,20 +77,18 @@ class BrokerMW():
         disc_req.msg_type = discovery_pb2.TYPE_REGISTER
         disc_req.register_req.CopyFrom(register_req)
 
-        # Send registration message
-        buf = register_req.SerializeToString()
+        # Send registration message - Use disc_req instead of register_req
+        buf = disc_req.SerializeToString()  # Changed from register_req to disc_req
         self.logger.debug(f"BrokerMW::register - Sending registration request: {buf}")
         self.req.send(buf)
 
         # wait for response
         response = self.req.recv()
-        # parse response
-        reg_resp = discovery_pb2.RegisterResp()
-        reg_resp.ParseFromString(response) 
-        self.logger.debug(f"BrokerMW::register - Received response: {reg_resp.status}")
-        return reg_resp.register_resp
-
-
+        # parse response 
+        disc_resp = discovery_pb2.DiscoveryResp()  # Changed to DiscoveryResp
+        disc_resp.ParseFromString(response)
+        self.logger.debug(f"BrokerMW::register - Received response: {disc_resp.register_resp.status}")
+        return disc_resp.register_resp
 
     def set_upcall_handle(self, upcall_obj): # upcall function same as in Publisher
         self.logger.info("BrokerMW::set_upcall_handle - setting upcall handle")
