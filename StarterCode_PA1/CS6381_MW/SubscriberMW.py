@@ -273,6 +273,18 @@ class SubscriberMW:
             # Pass to application layer
             self.upcall_obj.process_message(topic, content)
             
+            # Save in CSV
+            csv_filename = "subscriber_data.csv"
+            file_exists = os.path.exists(csv_filename)
+            
+            with open(csv_filename, mode="a", newline="") as csv_file:
+                csv_writer = csv.writer(csv_file)
+                if not file_exists:
+                    csv_writer.writerow(["timestamp", "topic", "content"])  
+                csv_writer.writerow([timestamp, topic, content])  
+
+            self.logger.info(f"📂 Data saved to {csv_filename}")
+            
         except Exception as e:
             raise e
 
@@ -287,3 +299,18 @@ class SubscriberMW:
     ########################################
     def disable_event_loop(self):
         self.handle_events = False
+
+
+    def handle_subscription(self):
+        
+        message = self.sub.recv_string()
+        topic, content, timestamp = message.split(":")
+        
+        recv_time = time.time()
+        latency = recv_time - float(timestamp)
+
+        self.logger.info(f"Received topic: {topic}, latency: {latency:.6f}s")
+
+        # write in CSV
+        with open("latency_results.csv", "a") as f:
+            f.write(f"{topic},{recv_time},{latency}\n")
