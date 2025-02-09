@@ -301,16 +301,4 @@ class SubscriberMW:
         self.handle_events = False
 
 
-    def handle_subscription(self):
-        
-        message = self.sub.recv_string()
-        topic, content, timestamp = message.split(":")
-        
-        recv_time = time.time()
-        latency = recv_time - float(timestamp)
-
-        self.logger.info(f"Received topic: {topic}, latency: {latency:.6f}s")
-
-        # write in CSV
-        with open("latency_results.csv", "a") as f:
-            f.write(f"{topic},{recv_time},{latency}\n")
+   
