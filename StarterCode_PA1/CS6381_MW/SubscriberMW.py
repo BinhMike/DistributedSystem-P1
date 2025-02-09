@@ -39,6 +39,7 @@ import logging
 import zmq
 import configparser
 from CS6381_MW import discovery_pb2
+import csv
 
 class SubscriberMW:
     ########################################
