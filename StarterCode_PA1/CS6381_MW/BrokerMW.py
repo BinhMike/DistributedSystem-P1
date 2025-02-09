@@ -24,6 +24,7 @@ import zmq
 import logging
 import time
 from CS6381_MW import discovery_pb2  
+import time
 
 class BrokerMW():
     def __init__(self, logger):
@@ -116,6 +117,7 @@ class BrokerMW():
             self.logger.error(f"BrokerMW::forward_messages - error: {str(e)}")
             
         return False
+
     def event_loop(self, timeout=None):
         ''' Improved event loop with ZMQ Poller '''
         try:
@@ -178,3 +180,17 @@ class BrokerMW():
             self.context.term()
         except Exception as e:
             self.logger.error(f"BrokerMW::cleanup - error: {str(e)}")
+
+    def handle_subscription(self):
+        
+        message = self.sub.recv_string()
+        topic, content, timestamp = message.split(":")
+        
+        recv_time = time.time()
+        latency = recv_time - float(timestamp)
+
+        self.logger.info(f"Received topic: {topic}, latency: {latency:.6f}s")
+
+        # write in CSV
+        with open("latency_results.csv", "a") as f:
+            f.write(f"{topic},{recv_time},{latency}\n")
