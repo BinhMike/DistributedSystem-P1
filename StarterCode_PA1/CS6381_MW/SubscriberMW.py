@@ -77,6 +77,7 @@ class SubscriberMW:
 
             # Register REQ socket with the poller (expecting Discovery responses)
             self.poller.register(self.req, zmq.POLLIN)
+            self.poller.register(self.sub, zmq.POLLIN)
 
             # Connect to Discovery Service
             connect_str = "tcp://" + args.discovery
@@ -253,10 +254,7 @@ class SubscriberMW:
                 for topic in topiclist:
                     self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
                     self.logger.info(f"Subscribed to topic: {topic}")
-
-            # Register the SUB socket with poller
-            self.poller.register(self.sub, zmq.POLLIN)
-
+            return 0
         except Exception as e:
             raise e
 
