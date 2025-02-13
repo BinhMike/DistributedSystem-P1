@@ -68,12 +68,16 @@ class SubscriberAppln:
         try:
             self.logger.info("SubscriberAppln::configure")
 
+            # Parse config file
+            self.config = configparser.ConfigParser()
+            self.config.read(args.config)
+
             self.name = args.name
-            self.num_topics = args.num_topics  # Get number of topics from CLI args
+            self.num_topics = args.num_topics  
 
             # Select topics dynamically using TopicSelector
             ts = TopicSelector()
-            self.topiclist = ts.interest(self.num_topics)  # Randomly select topics
+            self.topiclist = ts.interest(self.num_topics)  
             
             self.logger.info(f"SubscriberAppln::configure - Subscribing to topics: {self.topiclist}")
 
