@@ -148,24 +148,37 @@ class SubscriberAppln:
     ########################################
     def lookup_response(self, lookup_resp):
         try:
+            self.logger.info("SubscriberAppln::lookup_response")
+            
             # Check dissemination strategy from config
             strategy = self.config["Dissemination"]["Strategy"]
             
-            if strategy == "Broker":
+            if strategy == "ViaBroker":
                 # Connect to broker instead of publishers
-                # Broker typically runs on port 6000
+                if not lookup_resp.broker.addr:
+                    self.logger.error("No broker available")
+                    return 1  # Retry after delay
+                    
                 broker_addr = f"tcp://{lookup_resp.broker.addr}:{lookup_resp.broker.port}"
-                self.logger.info(f"SubscriberAppln::lookup_response - Connecting to broker at {broker_addr}")
+                self.logger.info(f"Connecting to broker at {broker_addr}")
                 self.mw_obj.subscribe_to_topics(broker_addr, None)  # None indicates broker mode
-            else:
-                # Direct strategy - connect to publishers
+                
+            else:  # Direct strategy
+                if not lookup_resp.publishers:
+                    self.logger.error("No publishers found")
+                    return 1  # Retry after delay
+                    
+                # Connect to each publisher
                 for pub in lookup_resp.publishers:
                     pub_address = f"tcp://{pub.addr}:{pub.port}"
+                    self.logger.info(f"Connecting to publisher at {pub_address}")
                     self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
 
             # Move to listening state
+            self.logger.info("Moving to LISTENING state")
             self.state = self.State.LISTENING
-            return 0
+            
+            return None  # Keep listening for messages
 
         except Exception as e:
             self.logger.error(f"Error in lookup_response: {str(e)}")
