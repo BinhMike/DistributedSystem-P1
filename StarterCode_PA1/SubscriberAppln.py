@@ -154,31 +154,31 @@ class SubscriberAppln:
             strategy = self.config["Dissemination"]["Strategy"]
             
             if strategy == "ViaBroker":
-                # Connect to broker instead of publishers
-                if not lookup_resp.broker.addr:
+                # Check if broker field exists and has address
+                if not lookup_resp.broker or not lookup_resp.broker.addr:
                     self.logger.error("No broker available")
-                    return 1  # Retry after delay
+                    return 1
                     
                 broker_addr = f"tcp://{lookup_resp.broker.addr}:{lookup_resp.broker.port}"
                 self.logger.info(f"Connecting to broker at {broker_addr}")
-                self.mw_obj.subscribe_to_topics(broker_addr, None)  # None indicates broker mode
+                self.mw_obj.subscribe_to_topics(broker_addr, None)
                 
             else:  # Direct strategy
+                # Check if publishers field has entries
                 if not lookup_resp.publishers:
                     self.logger.error("No publishers found")
-                    return 1  # Retry after delay
+                    return 1
                     
                 # Connect to each publisher
                 for pub in lookup_resp.publishers:
-                    pub_address = f"tcp://{pub.addr}:{pub.port}"
-                    self.logger.info(f"Connecting to publisher at {pub_address}")
-                    self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
+                    if pub.addr and pub.port:  # Verify both address and port exist
+                        pub_address = f"tcp://{pub.addr}:{pub.port}"
+                        self.logger.info(f"Connecting to publisher at {pub_address}")
+                        self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
 
-            # Move to listening state
             self.logger.info("Moving to LISTENING state")
             self.state = self.State.LISTENING
-            
-            return None  # Keep listening for messages
+            return None
 
         except Exception as e:
             self.logger.error(f"Error in lookup_response: {str(e)}")
