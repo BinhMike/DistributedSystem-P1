@@ -265,7 +265,9 @@ def parseCmdLineArgs():
 # Main function
 ###################################
 def main():
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # Set root logger to DEBUG
+    logging.basicConfig(level=logging.DEBUG, 
+                       format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logger = logging.getLogger("SubscriberAppln")
 
     args = parseCmdLineArgs()
