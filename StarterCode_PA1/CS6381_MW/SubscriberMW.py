@@ -128,6 +128,10 @@ class SubscriberMW:
                 timeout = self.upcall_obj.isready_response(disc_resp.isready_resp)
             elif disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
                 # Make upcall to application layer with lookup response
+
+                ## see if broker address is parsed correctly
+                self.logger.debug(f"Lookup response broker info: {disc_resp.lookup_resp.broker}")
+
                 timeout = self.upcall_obj.lookup_response(disc_resp.lookup_resp)
             else:
                 raise ValueError(f"Unhandled response type: {disc_resp.msg_type}")
