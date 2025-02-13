@@ -271,6 +271,7 @@ class SubscriberMW:
                 csv_writer = csv.writer(csv_file)
                 if not file_exists:
                     csv_writer.writerow(["timestamp", "topic", "content"])  
+                timestamp = time.time()
                 csv_writer.writerow([timestamp, topic, content])  
 
             self.logger.info(f"📂 Data saved to {csv_filename}")
