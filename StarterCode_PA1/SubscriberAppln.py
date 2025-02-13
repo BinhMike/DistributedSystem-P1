@@ -143,12 +143,29 @@ class SubscriberAppln:
     # Handle Lookup Response
     ########################################
     def lookup_response(self, lookup_resp):
-        ''' Handle publisher lookup response '''
-        self.logger.info("SubscriberAppln::lookup_response - connecting to publishers")
+        try:
+            # Check dissemination strategy from config
+            strategy = self.config["Dissemination"]["Strategy"]
+            
+            if strategy == "Broker":
+                # Connect to broker instead of publishers
+                # Broker typically runs on port 6000
+                broker_addr = f"tcp://{lookup_resp.broker.addr}:{lookup_resp.broker.port}"
+                self.logger.info(f"SubscriberAppln::lookup_response - Connecting to broker at {broker_addr}")
+                self.mw_obj.subscribe_to_topics(broker_addr, None)  # None indicates broker mode
+            else:
+                # Direct strategy - connect to publishers
+                for pub in lookup_resp.publishers:
+                    pub_address = f"tcp://{pub.addr}:{pub.port}"
+                    self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
 
-        for pub in lookup_resp.publishers:
-            pub_address = f"tcp://{pub.addr}:{pub.port}"
-            self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
+            # Move to listening state
+            self.state = self.State.LISTENING
+            return 0
+
+        except Exception as e:
+            self.logger.error(f"Error in lookup_response: {str(e)}")
+            raise e
 
     ########################################
     # Handle Register Response (Upcall)
@@ -177,7 +194,6 @@ class SubscriberAppln:
     # Handle IsReady Response (Upcall)
     ########################################
 
-    ## TODO 
     def isready_response(self, isready_resp):
         ''' Handle response to is_ready request '''
         try:
@@ -197,20 +213,7 @@ class SubscriberAppln:
 
         except Exception as e:
             raise e
-    def lookup_response(self, lookup_resp):
-        try:
-            # Connect to discovered publishers
-            for pub in lookup_resp.publishers:
-                pub_address = f"tcp://{pub.addr}:{pub.port}"
-                self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
 
-            # Move to listening state
-            self.state = self.State.LISTENING
-
-            return 0 # Return 0 to stay in event loop
-        
-        except Exception as e:
-            raise e
     ########################################
     # Handle Incoming Messages
     ########################################

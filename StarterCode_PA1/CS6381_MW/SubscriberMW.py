@@ -127,21 +127,8 @@ class SubscriberMW:
             elif disc_resp.msg_type == discovery_pb2.TYPE_ISREADY:
                 timeout = self.upcall_obj.isready_response(disc_resp.isready_resp)
             elif disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
-                publishers = disc_resp.lookup_resp.publishers
-                
-                if self.dissemination == "Direct":
-                    for pub in publishers:
-                        pub_addr = f"tcp://{pub.addr}:{pub.port}"
-                        self.subscribe_to_topics(pub_addr, self.topiclist)
-                else:  # ViaBroker
-                    broker = disc_resp.lookup_resp.broker
-                    if broker and broker.addr and broker.port:
-                        broker_addr = f"tcp://{broker.addr}:{broker.port}"
-                        self.subscribe_to_topics(broker_addr, None)
-                    else:
-                        self.logger.warning("No valid broker information received")
-
-                timeout = None
+                # Make upcall to application layer with lookup response
+                timeout = self.upcall_obj.lookup_response(disc_resp.lookup_resp)
             else:
                 raise ValueError(f"Unhandled response type: {disc_resp.msg_type}")
                 
@@ -298,6 +285,3 @@ class SubscriberMW:
     ########################################
     def disable_event_loop(self):
         self.handle_events = False
-
-
-   
