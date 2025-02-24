@@ -68,12 +68,16 @@ class SubscriberAppln:
         try:
             self.logger.info("SubscriberAppln::configure")
 
+            # Parse config file
+            self.config = configparser.ConfigParser()
+            self.config.read(args.config)
+
             self.name = args.name
-            self.num_topics = args.num_topics  # Get number of topics from CLI args
+            self.num_topics = args.num_topics  
 
             # Select topics dynamically using TopicSelector
             ts = TopicSelector()
-            self.topiclist = ts.interest(self.num_topics)  # Randomly select topics
+            self.topiclist = ts.interest(self.num_topics)  
             
             self.logger.info(f"SubscriberAppln::configure - Subscribing to topics: {self.topiclist}")
 
@@ -143,12 +147,42 @@ class SubscriberAppln:
     # Handle Lookup Response
     ########################################
     def lookup_response(self, lookup_resp):
-        ''' Handle publisher lookup response '''
-        self.logger.info("SubscriberAppln::lookup_response - connecting to publishers")
+        try:
+            self.logger.info("SubscriberAppln::lookup_response")
+            
+            # Check dissemination strategy from config
+            strategy = self.config["Dissemination"]["Strategy"]
+            
+            if strategy == "ViaBroker":
+                # Check if broker field exists and has address
+                if not lookup_resp.broker or not lookup_resp.broker.addr:
+                    self.logger.error("No broker available")
+                    return 1
+                    
+                broker_addr = f"tcp://{lookup_resp.broker.addr}:{lookup_resp.broker.port}"
+                self.logger.info(f"Connecting to broker at {broker_addr}")
+                self.mw_obj.subscribe_to_topics(broker_addr, None)
+                
+            else:  # Direct strategy
+                # Check if publishers field has entries
+                if not lookup_resp.publishers:
+                    self.logger.error("No publishers found")
+                    return 1
+                    
+                # Connect to each publisher
+                for pub in lookup_resp.publishers:
+                    if pub.addr and pub.port:  # Verify both address and port exist
+                        pub_address = f"tcp://{pub.addr}:{pub.port}"
+                        self.logger.info(f"Connecting to publisher at {pub_address}")
+                        self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
 
-        for pub in lookup_resp.publishers:
-            pub_address = f"tcp://{pub.addr}:{pub.port}"
-            self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
+            self.logger.info("Moving to LISTENING state")
+            self.state = self.State.LISTENING
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Error in lookup_response: {str(e)}")
+            raise e
 
     ########################################
     # Handle Register Response (Upcall)
@@ -177,7 +211,6 @@ class SubscriberAppln:
     # Handle IsReady Response (Upcall)
     ########################################
 
-    ## TODO 
     def isready_response(self, isready_resp):
         ''' Handle response to is_ready request '''
         try:
@@ -197,20 +230,7 @@ class SubscriberAppln:
 
         except Exception as e:
             raise e
-    def lookup_response(self, lookup_resp):
-        try:
-            # Connect to discovered publishers
-            for pub in lookup_resp.publishers:
-                pub_address = f"tcp://{pub.addr}:{pub.port}"
-                self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
 
-            # Move to listening state
-            self.state = self.State.LISTENING
-
-            return 0 # Return 0 to stay in event loop
-        
-        except Exception as e:
-            raise e
     ########################################
     # Handle Incoming Messages
     ########################################
@@ -245,7 +265,9 @@ def parseCmdLineArgs():
 # Main function
 ###################################
 def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # Set root logger to DEBUG
+    logging.basicConfig(level=logging.DEBUG, 
+                       format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logger = logging.getLogger("SubscriberAppln")
 
     args = parseCmdLineArgs()

@@ -37,7 +37,9 @@ import sys
 import time
 import logging
 import zmq
+import configparser
 from CS6381_MW import discovery_pb2
+import csv
 
 class SubscriberMW:
     ########################################
@@ -50,6 +52,11 @@ class SubscriberMW:
         self.poller = None  # Poller for async event handling
         self.upcall_obj = None  # Application logic handle
         self.handle_events = True  # Event loop flag
+        self.topiclist = None
+        # Add config parser
+        self.config = configparser.ConfigParser()
+        self.config.read('config.ini')
+        self.dissemination = self.config['Dissemination']['Strategy']
 
     ########################################
     # Configure Middleware
@@ -70,6 +77,7 @@ class SubscriberMW:
 
             # Register REQ socket with the poller (expecting Discovery responses)
             self.poller.register(self.req, zmq.POLLIN)
+            self.poller.register(self.sub, zmq.POLLIN)
 
             # Connect to Discovery Service
             connect_str = "tcp://" + args.discovery
@@ -119,6 +127,11 @@ class SubscriberMW:
             elif disc_resp.msg_type == discovery_pb2.TYPE_ISREADY:
                 timeout = self.upcall_obj.isready_response(disc_resp.isready_resp)
             elif disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
+                # Make upcall to application layer with lookup response
+
+                ## see if broker address is parsed correctly
+                self.logger.debug(f"Lookup response broker info: {disc_resp.lookup_resp.broker}")
+
                 timeout = self.upcall_obj.lookup_response(disc_resp.lookup_resp)
             else:
                 raise ValueError(f"Unhandled response type: {disc_resp.msg_type}")
@@ -135,6 +148,8 @@ class SubscriberMW:
         ''' Register the subscriber with the Discovery Service '''
         try:
             self.logger.info("SubscriberMW::register")
+            # Store topiclist for later use
+            self.topiclist = topiclist
 
             # Populate registration request
             reg_info = discovery_pb2.RegistrantInfo()
@@ -223,13 +238,14 @@ class SubscriberMW:
             self.sub.connect(pub_address)
 
             # Subscribe to topics
-            for topic in topiclist:
-                self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
-                self.logger.info(f"Subscribed to topic: {topic}")
-
-            # Register the SUB socket with poller
-            self.poller.register(self.sub, zmq.POLLIN)
-
+            if not topiclist:  # Broker part
+                self.sub.setsockopt_string(zmq.SUBSCRIBE, "")
+                self.logger.info(f"SubscriberMW::subscribe_to_topics - Connected to Broker, subscribing to all topics")
+            else: # publisher
+                for topic in topiclist:
+                    self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
+                    self.logger.info(f"Subscribed to topic: {topic}")
+            return 0
         except Exception as e:
             raise e
 
@@ -246,6 +262,19 @@ class SubscriberMW:
             
             # Pass to application layer
             self.upcall_obj.process_message(topic, content)
+            
+            # Save in CSV
+            csv_filename = "subscriber_data.csv"
+            file_exists = os.path.exists(csv_filename)
+            
+            with open(csv_filename, mode="a", newline="") as csv_file:
+                csv_writer = csv.writer(csv_file)
+                if not file_exists:
+                    csv_writer.writerow(["timestamp", "topic", "content"])  
+                timestamp = time.time()
+                csv_writer.writerow([timestamp, topic, content])  
+
+            self.logger.info(f"📂 Data saved to {csv_filename}")
             
         except Exception as e:
             raise e
