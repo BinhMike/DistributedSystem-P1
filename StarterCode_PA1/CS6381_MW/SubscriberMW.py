@@ -258,7 +258,12 @@ class SubscriberMW:
             
             # Receive published message
             message = self.sub.recv_string()
-            topic, content = message.split(":", 1)
+            topic, time_sent, content = message.split(":", 2)  
+            time_sent = float(time_sent)  # parse timestamp
+            time_received = time.time()  
+
+            # Calculate latency
+            latency = time_received - time_sent 
             
             # Pass to application layer
             self.upcall_obj.process_message(topic, content)
@@ -270,11 +275,10 @@ class SubscriberMW:
             with open(csv_filename, mode="a", newline="") as csv_file:
                 csv_writer = csv.writer(csv_file)
                 if not file_exists:
-                    csv_writer.writerow(["timestamp", "topic", "content"])  
-                timestamp = time.time()
-                csv_writer.writerow([timestamp, topic, content])  
+                    csv_writer.writerow(["timestamp", "topic", "latency", "content"])  
+                csv_writer.writerow([time_received, topic, latency, content]) 
 
-            self.logger.info(f"📂 Data saved to {csv_filename}")
+            self.logger.info(f"Data saved to {csv_filename}, Latency: {latency:.6f} s")
             
         except Exception as e:
             raise e
