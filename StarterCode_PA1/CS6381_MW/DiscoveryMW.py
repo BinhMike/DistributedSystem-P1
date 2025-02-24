@@ -3,33 +3,23 @@
 # Author: Aniruddha Gokhale
 # Vanderbilt University
 #
-# Purpose: Skeleton/Starter code for the discovery middleware code
-#
-# Created: Spring 2023
+# Purpose: Middleware for Discovery Service using ZooKeeper
 #
 ###############################################
 
-# Designing the logic is left as an exercise for the student.
-#
-# The discovery service is a server. So at the middleware level, we will maintain
-# a REP socket binding it to the port on which we expect to receive requests.
-#
-# There will be a forever event loop waiting for requests. Each request will be parsed
-# and the application logic asked to handle the request. To that end, an upcall will need
-# to be made to the application logic.
-
 import zmq
 import logging
+from kazoo.client import KazooClient
 from CS6381_MW import discovery_pb2
 
 class DiscoveryMW:
     ########################################
     # Constructor
     ########################################
-    def __init__(self, logger):
+    def __init__(self, logger, zk_client):
         self.logger = logger
+        self.zk = zk_client  # ZooKeeper client
         self.rep = None  # REP socket for handling requests
-        self.registry = {"publishers": {}, "subscribers": {}}  # Store registered entities
         self.upcall_obj = None  # Application logic handle
 
     ########################################
@@ -37,7 +27,6 @@ class DiscoveryMW:
     ########################################
     def configure(self, args):
         ''' Initialize the Discovery Middleware '''
-
         try:
             self.logger.info("DiscoveryMW::configure")
 
@@ -74,12 +63,6 @@ class DiscoveryMW:
                     response = self.upcall_obj.register(disc_req.register_req)
                 elif disc_req.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
                     response = self.upcall_obj.lookup(disc_req.lookup_req)
-                elif disc_req.msg_type == discovery_pb2.TYPE_ISREADY:
-                    response = self.upcall_obj.is_ready()
-                else:
-                    self.logger.error("DiscoveryMW::event_loop - Unknown request type")
-                    response = discovery_pb2.DiscoveryResp()
-                    response.msg_type = discovery_pb2.TYPE_UNKNOWN
 
                 # Serialize and send the response
                 self.rep.send(response.SerializeToString())
@@ -87,9 +70,6 @@ class DiscoveryMW:
         except Exception as e:
             raise e
 
-    ########################################
-    # Set Upcall Handle
-    ########################################
     def set_upcall_handle(self, upcall_obj):
         ''' Save reference to the application logic '''
         self.upcall_obj = upcall_obj
