@@ -39,6 +39,7 @@ import logging
 import zmq
 import configparser
 from CS6381_MW import discovery_pb2
+import csv
 
 class SubscriberMW:
     ########################################
@@ -76,6 +77,7 @@ class SubscriberMW:
 
             # Register REQ socket with the poller (expecting Discovery responses)
             self.poller.register(self.req, zmq.POLLIN)
+            self.poller.register(self.sub, zmq.POLLIN)
 
             # Connect to Discovery Service
             connect_str = "tcp://" + args.discovery
@@ -125,21 +127,12 @@ class SubscriberMW:
             elif disc_resp.msg_type == discovery_pb2.TYPE_ISREADY:
                 timeout = self.upcall_obj.isready_response(disc_resp.isready_resp)
             elif disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
-                publishers = disc_resp.lookup_resp.publishers
-                
-                if self.dissemination == "Direct":
-                    for pub in publishers:
-                        pub_addr = f"tcp://{pub.addr}:{pub.port}"
-                        self.subscribe_to_topics(pub_addr, self.topiclist)
-                else:  # ViaBroker
-                    broker = disc_resp.lookup_resp.broker
-                    if broker and broker.addr and broker.port:
-                        broker_addr = f"tcp://{broker.addr}:{broker.port}"
-                        self.subscribe_to_topics(broker_addr, None)
-                    else:
-                        self.logger.warning("No valid broker information received")
+                # Make upcall to application layer with lookup response
 
-                timeout = None
+                ## see if broker address is parsed correctly
+                self.logger.debug(f"Lookup response broker info: {disc_resp.lookup_resp.broker}")
+
+                timeout = self.upcall_obj.lookup_response(disc_resp.lookup_resp)
             else:
                 raise ValueError(f"Unhandled response type: {disc_resp.msg_type}")
                 
@@ -252,10 +245,7 @@ class SubscriberMW:
                 for topic in topiclist:
                     self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
                     self.logger.info(f"Subscribed to topic: {topic}")
-
-            # Register the SUB socket with poller
-            self.poller.register(self.sub, zmq.POLLIN)
-
+            return 0
         except Exception as e:
             raise e
 
@@ -272,6 +262,19 @@ class SubscriberMW:
             
             # Pass to application layer
             self.upcall_obj.process_message(topic, content)
+            
+            # Save in CSV
+            csv_filename = "subscriber_data.csv"
+            file_exists = os.path.exists(csv_filename)
+            
+            with open(csv_filename, mode="a", newline="") as csv_file:
+                csv_writer = csv.writer(csv_file)
+                if not file_exists:
+                    csv_writer.writerow(["timestamp", "topic", "content"])  
+                timestamp = time.time()
+                csv_writer.writerow([timestamp, topic, content])  
+
+            self.logger.info(f"📂 Data saved to {csv_filename}")
             
         except Exception as e:
             raise e
