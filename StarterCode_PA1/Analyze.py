@@ -1,7 +1,9 @@
+import matplotlib
+matplotlib.use("Agg")
 import pandas as pd
 import matplotlib.pyplot as plt
 
-df = pd.read_csv("latency_results.csv", names=["topic", "time", "latency"])
+df = pd.read_csv("subscriber_data.csv", names=["timestamp", "topic", "latency","content"], skiprows = 1)
 
 
 plt.figure(figsize=(10, 5))
@@ -11,9 +13,9 @@ plt.ylabel("Frequency")
 plt.title("Latency Distribution Between Publisher and Subscriber")
 plt.legend()
 plt.grid()
-plt.show()
+# plt.show()
 
-
+plt.savefig(" Latency_distribution.png", dpi=300)
 # avg_latency = df.groupby("topic")["latency"].mean()
 
 # plt.figure(figsize=(10, 5))
