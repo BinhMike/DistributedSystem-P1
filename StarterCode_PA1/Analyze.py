@@ -15,7 +15,7 @@ plt.legend()
 plt.grid()
 # plt.show()
 
-plt.savefig(" Latency_distribution.png", dpi=300)
+plt.savefig("Latency_distribution.png", dpi=300)
 # avg_latency = df.groupby("topic")["latency"].mean()
 
 # plt.figure(figsize=(10, 5))
