@@ -34,12 +34,8 @@ class DiscoveryAppln:
         try:
             self.logger.info("DiscoveryAppln::configure")
 
-            # Parse configuration file
-            config = configparser.ConfigParser()
-            config.read(args.config)
-
             # Initialize ZooKeeper
-            self.zk = KazooClient(hosts="127.0.0.1:2181")
+            self.zk = KazooClient(hosts=args.zookeeper)  # Use the command-line argument for ZooKeeper
             self.zk.start()
             self.zk.ensure_path("/discovery")  # Ensure discovery path exists
 
@@ -135,6 +131,7 @@ def parseCmdLineArgs():
 
     parser.add_argument("-p", "--port", type=int, default=5555, help="Port number to run Discovery Service")
     parser.add_argument("-a", "--addr", default="localhost", help="IP address of Discovery Service")
+    parser.add_argument("-z", "--zookeeper", default="127.0.0.1:2181", help="ZooKeeper address (default: 127.0.0.1:2181)")
     parser.add_argument("-c", "--config", default="config.ini", help="Configuration file (default: config.ini)")
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, choices=[10, 20, 30, 40, 50], help="Logging level")
 
@@ -152,9 +149,9 @@ def main():
     logger.setLevel(args.loglevel)
 
     app = DiscoveryAppln(logger)
-    app.configure(args)
+    app.configure(args)  # `args` now includes the ZooKeeper address
     app.run()
-
 
 if __name__ == "__main__":
     main()
+
