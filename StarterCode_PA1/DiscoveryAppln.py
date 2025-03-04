@@ -34,15 +34,36 @@ class DiscoveryAppln:
         try:
             self.logger.info("DiscoveryAppln::configure")
 
-            # Initialize ZooKeeper
-            self.zk = KazooClient(hosts=args.zookeeper)  # Use the command-line argument for ZooKeeper
-            self.zk.start()
-            self.zk.ensure_path("/discovery")  # Ensure discovery path exists
-
-            # Register this Discovery service as the leader
+            # Initialize ZooKeeper with more robust error handling
+            self.logger.info(f"Connecting to ZooKeeper at {args.zookeeper}")
+            self.zk = KazooClient(hosts=args.zookeeper)
+            self.zk.start(timeout=10)  # Add timeout parameter
+            
+            # Ensure parent paths exist first with explicit steps
+            self.logger.info("Creating ZooKeeper paths")
+            if not self.zk.exists("/discovery"):
+                self.logger.info("Creating /discovery path")
+                self.zk.create("/discovery", b"", makepath=True)
+            
+            # Handle the case if the node already exists (from previous run)
             discovery_address = f"{args.addr}:{args.port}"
-            self.zk.create("/discovery/leader", discovery_address.encode(), ephemeral=True, makepath=True)
-            self.logger.info(f"Discovery service registered in ZooKeeper at {discovery_address}")
+            leader_path = "/discovery/leader"
+            
+            if self.zk.exists(leader_path):
+                self.logger.info(f"Node {leader_path} already exists, deleting it first")
+                self.zk.delete(leader_path)
+            
+            # Now create the leader node
+            self.logger.info(f"Registering discovery leader at {discovery_address}")
+            self.zk.create(leader_path, discovery_address.encode(), ephemeral=True)
+            
+            # Verify the node was created
+            if self.zk.exists(leader_path):
+                data, _ = self.zk.get(leader_path)
+                self.logger.info(f"Successfully registered in ZooKeeper at {leader_path} with data: {data.decode()}")
+            else:
+                self.logger.error(f"Failed to create ZooKeeper node {leader_path}")
+                raise Exception(f"Failed to create ZooKeeper node {leader_path}")
 
             # Initialize the middleware
             self.logger.debug("DiscoveryAppln::configure - initializing middleware")
@@ -53,6 +74,7 @@ class DiscoveryAppln:
             self.logger.info("DiscoveryAppln::configure - configuration complete")
 
         except Exception as e:
+            self.logger.error(f"DiscoveryAppln::configure - Exception: {str(e)}")
             raise e
 
     ########################################
