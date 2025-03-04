@@ -73,6 +73,8 @@ class DiscoveryAppln:
 
             self.logger.info("DiscoveryAppln::configure - configuration complete")
 
+            self.dump_zk_nodes()
+
         except Exception as e:
             self.logger.error(f"DiscoveryAppln::configure - Exception: {str(e)}")
             raise e
@@ -89,23 +91,44 @@ class DiscoveryAppln:
         }
 
         role = role_map.get(register_req.role, "Unknown")
-        self.logger.info(f"Registering {role}: {register_req.info.id}")
+        entity_id = register_req.info.id
+        self.logger.info(f"Registering {role}: {entity_id}")
 
-        entity_path = f"/{role.lower()}s/{register_req.info.id}"
+        entity_path = f"/{role.lower()}s/{entity_id}"
         entity_data = f"{register_req.info.addr}:{register_req.info.port}"
 
-        # Register in ZooKeeper
-        self.zk.ensure_path(f"/{role.lower()}s")
-        self.zk.create(entity_path, entity_data.encode(), ephemeral=True, makepath=True)
+        # Register in ZooKeeper with error handling
+        try:
+            # Ensure parent path exists
+            self.zk.ensure_path(f"/{role.lower()}s")
+            
+            # Check if the node already exists
+            if self.zk.exists(entity_path):
+                self.logger.info(f"Node {entity_path} already exists, updating it")
+                self.zk.delete(entity_path)
+                
+            # Create the node (either new or replacing existing)
+            self.zk.create(entity_path, entity_data.encode(), ephemeral=True)
+            self.logger.info(f"Successfully created/updated ZooKeeper node {entity_path}")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to register {role} in ZooKeeper: {str(e)}")
+            
+            # Build error response
+            response = discovery_pb2.DiscoveryResp()
+            response.msg_type = discovery_pb2.TYPE_REGISTER
+            response.register_resp.status = discovery_pb2.STATUS_FAILURE
+            return response
 
         # Store registration details locally
-        self.registry[role.lower() + "s"][register_req.info.id] = {
+        category = role.lower() + "s"
+        self.registry[category][entity_id] = {
             "addr": register_req.info.addr,
             "port": register_req.info.port,
             "topics": list(register_req.topiclist)
         }
 
-        # Build response
+        # Build success response
         response = discovery_pb2.DiscoveryResp()
         response.msg_type = discovery_pb2.TYPE_REGISTER
         response.register_resp.status = discovery_pb2.STATUS_SUCCESS
@@ -118,16 +141,28 @@ class DiscoveryAppln:
     def lookup(self, lookup_req):
         ''' Handle subscriber lookup request '''
         self.logger.info(f"Lookup request for topics: {lookup_req.topiclist}")
-
-        # Query ZooKeeper for available publishers
         matched_publishers = []
-        publishers = self.zk.get_children("/publishers")
 
-        for pub_id in publishers:
-            data, _ = self.zk.get(f"/publishers/{pub_id}")
-            addr, port = data.decode().split(":")
-            pub_info = discovery_pb2.RegistrantInfo(id=pub_id, addr=addr, port=int(port))
-            matched_publishers.append(pub_info)
+        try:
+            # Check if publishers path exists before querying
+            if not self.zk.exists("/publishers"):
+                self.logger.info("No publishers registered yet")
+            else:
+                # Query ZooKeeper for available publishers
+                publishers = self.zk.get_children("/publishers")
+                self.logger.info(f"Found {len(publishers)} publishers in ZooKeeper")
+
+                for pub_id in publishers:
+                    try:
+                        data, _ = self.zk.get(f"/publishers/{pub_id}")
+                        addr, port = data.decode().split(":")
+                        pub_info = discovery_pb2.RegistrantInfo(id=pub_id, addr=addr, port=int(port))
+                        matched_publishers.append(pub_info)
+                    except Exception as e:
+                        self.logger.error(f"Error retrieving publisher {pub_id}: {str(e)}")
+
+        except Exception as e:
+            self.logger.error(f"Error during lookup: {str(e)}")
 
         # Build response
         response = discovery_pb2.DiscoveryResp()
@@ -143,6 +178,27 @@ class DiscoveryAppln:
         ''' Run Discovery Service Event Loop '''
         self.logger.info("DiscoveryAppln::run - entering event loop")
         self.mw_obj.event_loop()
+
+    def dump_zk_nodes(self):
+        """Debug method to dump ZooKeeper node structure"""
+        self.logger.info("Current ZooKeeper nodes:")
+        
+        def print_tree(path, level=0):
+            children = self.zk.get_children(path)
+            for child in children:
+                child_path = f"{path}/{child}" if path != "/" else f"/{child}"
+                data = None
+                try:
+                    data_bytes, _ = self.zk.get(child_path)
+                    data = data_bytes.decode() if data_bytes else None
+                except:
+                    pass
+                
+                self.logger.info(f"{'  ' * level}|- {child} {f'({data})' if data else ''}")
+                print_tree(child_path, level + 1)
+        
+        # Start from root
+        print_tree("/")
 
 
 ###################################
