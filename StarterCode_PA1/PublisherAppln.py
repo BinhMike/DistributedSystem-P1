@@ -104,12 +104,27 @@ class PublisherAppln:
                 return None
 
             elif self.state == self.State.DISSEMINATE:
-                self.logger.info("PublisherAppln::invoke_operation - Start Disseminating")
-                ts = TopicSelector()
-                for _ in range(self.iters):
+                # We are here because both registration and is ready is done. So the only thing
+                # left for us as a publisher is dissemination, which we do it actively here.
+                self.logger.info ("PublisherAppln::invoke_operation - start Disseminating")
+
+                # Now disseminate topics at the rate at which we have configured ourselves.
+                ts = TopicSelector ()
+                for i in range (self.iters):
+                # I leave it to you whether you want to disseminate all the topics of interest in
+                # each iteration OR some subset of it. Please modify the logic accordingly.
+                # Here, we choose to disseminate on all topics that we publish.  Also, we don't care
+                # about their values. But in future assignments, this can change.
                     for topic in self.topiclist:
-                        self.mw_obj.disseminate(self.name, topic, ts.gen_publication(topic))
-                    time.sleep(1 / float(self.frequency))
+                        # For now, we have chosen to send info in the form "topic name: topic value"
+                        # In later assignments, we should be using more complex encodings using
+                        # protobuf.  In fact, I am going to do this once my basic logic is working.
+                        dissemination_data = ts.gen_publication (topic)
+                        self.mw_obj.disseminate (self.name, topic, dissemination_data)
+
+                # Now sleep for an interval of time to ensure we disseminate at the
+                # frequency that was configured.
+                time.sleep (1/float (self.frequency))  # ensure we get a floating point num
 
                 self.state = self.State.COMPLETED
                 return 0

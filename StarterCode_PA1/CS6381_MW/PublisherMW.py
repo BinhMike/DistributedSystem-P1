@@ -9,6 +9,9 @@
 #
 ###############################################
 # import the needed packages
+import os
+import sys
+import time
 import zmq
 import logging
 from CS6381_MW import discovery_pb2
@@ -105,20 +108,21 @@ class PublisherMW:
         except Exception as e:
             raise e
     def disseminate (self, id, topic, data):
-      try:
-        self.logger.debug ("PublisherMW::disseminate")
+        try:
+            self.logger.debug ("PublisherMW::disseminate")
 
-        # Now use the protobuf logic to encode the info and send it.  But for now
-        # we are simply sending the string to make sure dissemination is working.
-        send_str = topic + ":" + data
-        self.logger.debug ("PublisherMW::disseminate - {}".format (send_str))
+            # Now use the protobuf logic to encode the info and send it.  But for now
+            # we are simply sending the string to make sure dissemination is working.
+            timestamp = time.time()  # add time stamp
+            send_str = f"{topic}:{timestamp}:{data}"  
+            self.logger.debug (f"PublisherMW::disseminate - {send_str}")
 
-        # send the info as bytes. See how we are providing an encoding of utf-8
-        self.pub.send (bytes(send_str, "utf-8"))
+            # send the info as bytes. See how we are providing an encoding of utf-8
+            self.pub.send (bytes(send_str, "utf-8"))
 
-        self.logger.debug ("PublisherMW::disseminate complete")
-      except Exception as e:
-        raise e
+            self.logger.debug ("PublisherMW::disseminate complete")
+        except Exception as e:
+            raise e
 
     def set_upcall_handle(self, upcall_obj):
         self.upcall_obj = upcall_obj
