@@ -104,3 +104,53 @@ class SubscriberMW:
 
         except Exception as e:
             raise e
+
+    def lookup_publishers(self, topics):
+        """Lookup publishers for topics of interest"""
+        try:
+            self.logger.info("SubscriberMW::lookup_publishers")
+            
+            lookup_req = discovery_pb2.LookupPubByTopicReq()
+            lookup_req.topiclist.extend(topics)
+            
+            # Create and send discovery request
+            disc_req = discovery_pb2.DiscoveryReq(
+                msg_type=discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC,
+                lookup_req=lookup_req
+            )
+            self.req.send(disc_req.SerializeToString())
+            
+        except Exception as e:
+            self.logger.error(f"Error in lookup_publishers: {str(e)}")
+            raise e
+
+    def subscribe_to_topics(self, publisher_addr, topics):
+        """Connect to a publisher and subscribe to topics"""
+        try:
+            self.logger.info(f"SubscriberMW::subscribe_to_topics - {publisher_addr}, topics: {topics}")
+            
+            # Connect if not already connected
+            if publisher_addr not in self.connected_publishers:
+                self.sub.connect(publisher_addr)
+                self.connected_publishers.add(publisher_addr)
+                
+            # Subscribe to each topic
+            for topic in topics:
+                self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
+                self.logger.info(f"Subscribed to topic: {topic}")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to subscribe: {str(e)}")
+            raise e
+
+    def handle_subscription(self):
+        """Process received publication"""
+        try:
+            message = self.sub.recv_string()
+            # Split the message into topic and content
+            topic, content = message.split(":", 1)
+            self.logger.debug(f"Received: {topic} - {content}")
+            return self.upcall_obj.process_message(topic, content)
+        except Exception as e:
+            self.logger.error(f"Error handling subscription: {str(e)}")
+            raise e

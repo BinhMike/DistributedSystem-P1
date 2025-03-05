@@ -67,10 +67,11 @@ class SubscriberAppln:
         self.mw_obj.register(self.name, self.topiclist)
 
     def register_response(self, reg_resp):
-        """ Handle registration response and lookup publishers """
+        """Handle registration response and lookup publishers"""
         if reg_resp.status == discovery_pb2.STATUS_SUCCESS:
             self.logger.info("SubscriberAppln::register_response - Registration successful")
-            self.mw_obj.lookup_publishers(self.topiclist)  # Lookup publishers for selected topics
+            self.mw_obj.lookup_publishers(self.topiclist)
+        return None
 
     def lookup_response(self, lookup_resp):
         """ Subscribe to publishers that disseminate the selected topics """
