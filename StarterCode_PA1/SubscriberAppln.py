@@ -76,9 +76,27 @@ class SubscriberAppln:
 
     def lookup_response(self, lookup_resp):
         """ Subscribe to publishers that disseminate the selected topics """
-        for pub in lookup_resp.publishers:
-            self.logger.info(f"Found Publisher {pub.id} at {pub.addr}:{pub.port}, Topic: {pub.topic}")
-            self.mw_obj.subscribe_to_topics(f"tcp://{pub.addr}:{pub.port}", pub.topic)
+        try:
+            self.logger.info("SubscriberAppln::lookup_response")
+            
+            # Example using Direct strategy (like your pre-ZK version)
+            if not lookup_resp.publishers:
+                self.logger.error("No publishers found")
+                return 1
+
+            # Connect to each publisher
+            for pub in lookup_resp.publishers:
+                if pub.addr and pub.port:
+                    pub_address = f"tcp://{pub.addr}:{pub.port}"
+                    self.logger.info(f"Connecting to publisher at {pub_address}")
+                    self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
+            
+            self.logger.info("Moving to LISTENING state")
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Error in lookup_response: {str(e)}")
+            raise e
 
     def process_message(self, topic, content):
         """ Process received messages from publishers """
