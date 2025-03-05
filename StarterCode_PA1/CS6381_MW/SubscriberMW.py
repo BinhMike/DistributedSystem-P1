@@ -1,5 +1,8 @@
+import os
+import time
 import zmq
 import logging
+import csv
 from CS6381_MW import discovery_pb2
 
 class SubscriberMW:
@@ -38,19 +41,26 @@ class SubscriberMW:
 
     def connect_to_discovery(self, discovery_addr):
         ''' Connects to Discovery '''
-        self.logger.info(f"Connecting to Discovery at {discovery_addr}")
+        self.logger.info(f"SubscriberMW::connect_to_discovery - Connecting to Discovery at {discovery_addr}")
 
-        if self.req:
+        # Only disconnect if we have a previous connection
+        if self.discovery_addr and self.req:
             try:
+                self.logger.info(f"Disconnecting from previous Discovery at {self.discovery_addr}")
                 self.req.disconnect(f"tcp://{self.discovery_addr}")
-            except zmq.error.ZMQError:
-                self.logger.warning(f"Failed to disconnect from {self.discovery_addr}")
+            except zmq.error.ZMQError as e:
+                self.logger.warning(f"Failed to disconnect from {self.discovery_addr}: {str(e)}")
 
-        self.req = zmq.Context().socket(zmq.REQ)
-        self.req.connect(f"tcp://{discovery_addr}")
-        self.discovery_addr = discovery_addr
+        # Connect to new address
+        try:
+            self.req.connect(f"tcp://{discovery_addr}")
+            self.discovery_addr = discovery_addr
+            self.logger.info(f"Successfully connected to Discovery at {discovery_addr}")
+        except Exception as e:
+            self.logger.error(f"Failed to connect to Discovery at {discovery_addr}: {str(e)}")
+            raise e
 
-    def event_loop(self, timeout=None):
+    def event_loop(self, timeout=1000):
         ''' Run the event loop waiting for messages from Discovery or Publishers '''
         try:
             self.logger.info("SubscriberMW::event_loop - running")
@@ -144,13 +154,32 @@ class SubscriberMW:
             raise e
 
     def handle_subscription(self):
-        """Process received publication"""
-        try:
-            message = self.sub.recv_string()
-            # Split the message into topic and content
-            topic, content = message.split(":", 1)
-            self.logger.debug(f"Received: {topic} - {content}")
-            return self.upcall_obj.process_message(topic, content)
-        except Exception as e:
-            self.logger.error(f"Error handling subscription: {str(e)}")
-            raise e
+            try:
+                self.logger.info("SubscriberMW::handle_subscription")
+                
+                # Receive published message
+                message = self.sub.recv_string()
+                topic, time_sent, content = message.split(":", 2)  
+                time_sent = float(time_sent)  # parse timestamp
+                time_received = time.time()  
+
+                # Calculate latency
+                latency = time_received - time_sent 
+                
+                # Pass to application layer
+                self.upcall_obj.process_message(topic, content)
+                
+                # Save in CSV
+                csv_filename = "subscriber_data.csv"
+                file_exists = os.path.exists(csv_filename)
+                
+                with open(csv_filename, mode="a", newline="") as csv_file:
+                    csv_writer = csv.writer(csv_file)
+                    if not file_exists:
+                        csv_writer.writerow(["timestamp", "topic", "latency", "content"])  
+                    csv_writer.writerow([time_received, topic, latency, content]) 
+
+                self.logger.info(f"Data saved to {csv_filename}, Latency: {latency:.6f} s")
+                
+            except Exception as e:
+                raise e
