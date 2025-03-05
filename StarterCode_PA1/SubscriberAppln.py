@@ -92,7 +92,7 @@ class SubscriberAppln:
                     self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
             
             self.logger.info("Moving to LISTENING state")
-            return 0
+            return None
 
         except Exception as e:
             self.logger.error(f"Error in lookup_response: {str(e)}")
@@ -101,6 +101,15 @@ class SubscriberAppln:
     def process_message(self, topic, content):
         """ Process received messages from publishers """
         self.logger.info(f"Received topic: {topic} | Content: {content}")
+
+    def invoke_operation(self):
+        """
+        This method is invoked when the event loop in the middleware times out.
+        For the subscriber, this can be used to implement periodic tasks,
+        or simply return None to continue waiting for events.
+        """
+        self.logger.debug("SubscriberAppln::invoke_operation - No events, continuing to wait")
+        return 1000  # Or implement some other periodic task
 
 def parseCmdLineArgs():
     parser = argparse.ArgumentParser(description="Subscriber Application")
