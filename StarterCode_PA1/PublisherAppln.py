@@ -73,17 +73,17 @@ class PublisherAppln:
         except Exception as e:
             raise e
 
-    def update_discovery_info(self, data, stat=None, event=None):
-      if data:
-          new_addr = data.decode("utf-8")
-          if new_addr != self.discovery_addr:
-              self.logger.info(f"Discovery changed to {new_addr}, reconnecting...")
-              self.discovery_addr = new_addr
-
-              # Ensure middleware is initialized before using it
-              if self.mw_obj:
-                  self.mw_obj.connect_to_discovery(self.discovery_addr)
-                  self.register()
+    def update_discovery_info(self, data, stat, event=None):
+        """ Update Discovery service address if it changes """
+        if data:
+            new_addr = data.decode("utf-8")
+            if new_addr != self.discovery_addr:
+                self.logger.info(f"Discovery changed to {new_addr}, reconnecting...")
+                self.discovery_addr = new_addr
+                # Only attempt to reconnect if middleware is properly configured
+                if self.mw_obj and hasattr(self.mw_obj, 'req') and self.mw_obj.req is not None:
+                    self.mw_obj.connect_to_discovery(self.discovery_addr)
+                    self.register()
 
     def driver(self):
         try:
