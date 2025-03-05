@@ -50,7 +50,8 @@ class SubscriberAppln:
             if new_addr != self.discovery_addr:
                 self.logger.info(f"Discovery changed to {new_addr}, reconnecting...")
                 self.discovery_addr = new_addr
-                if self.mw_obj:  # Ensure middleware exists before reconnecting
+                # Only reconnect if middleware has been configured (i.e. req is not None)
+                if self.mw_obj and getattr(self.mw_obj, 'req', None):
                     self.mw_obj.connect_to_discovery(self.discovery_addr)
                     self.register()
 
