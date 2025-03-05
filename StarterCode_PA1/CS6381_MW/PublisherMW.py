@@ -104,15 +104,21 @@ class PublisherMW:
 
         except Exception as e:
             raise e
+    def disseminate (self, id, topic, data):
+      try:
+        self.logger.debug ("PublisherMW::disseminate")
 
-    def disseminate(self, id, topic, data):
-        ''' Publish topic updates '''
-        try:
-            send_str = f"{topic}:{data}"
-            self.pub.send(send_str.encode("utf-8"))
-            self.logger.debug(f"PublisherMW::disseminate - {send_str}")
-        except Exception as e:
-            raise e
+        # Now use the protobuf logic to encode the info and send it.  But for now
+        # we are simply sending the string to make sure dissemination is working.
+        send_str = topic + ":" + data
+        self.logger.debug ("PublisherMW::disseminate - {}".format (send_str))
+
+        # send the info as bytes. See how we are providing an encoding of utf-8
+        self.pub.send (bytes(send_str, "utf-8"))
+
+        self.logger.debug ("PublisherMW::disseminate complete")
+      except Exception as e:
+        raise e
 
     def set_upcall_handle(self, upcall_obj):
         self.upcall_obj = upcall_obj
