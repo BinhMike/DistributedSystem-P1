@@ -92,7 +92,7 @@ class SubscriberAppln:
                     self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
             
             self.logger.info("Moving to LISTENING state")
-            return None
+            return 0
 
         except Exception as e:
             self.logger.error(f"Error in lookup_response: {str(e)}")
