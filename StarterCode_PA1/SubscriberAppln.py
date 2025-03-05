@@ -77,8 +77,8 @@ class SubscriberAppln:
     def lookup_response(self, lookup_resp):
         """ Subscribe to publishers that disseminate the selected topics """
         for pub in lookup_resp.publishers:
-            self.logger.info(f"Found Publisher {pub.id} at {pub.addr}:{pub.port}, Topics: {pub.topics}")
-            self.mw_obj.subscribe_to_topics(f"tcp://{pub.addr}:{pub.port}", pub.topics)
+            self.logger.info(f"Found Publisher {pub.id} at {pub.addr}:{pub.port}, Topic: {pub.topic}")
+            self.mw_obj.subscribe_to_topics(f"tcp://{pub.addr}:{pub.port}", pub.topic)
 
     def process_message(self, topic, content):
         """ Process received messages from publishers """
