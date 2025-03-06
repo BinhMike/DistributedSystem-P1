@@ -96,33 +96,47 @@ class PublisherAppln:
         except Exception as e:
             raise e
 
-    def invoke_operation (self):
-        ''' Invoke operating depending on state  '''
+    def invoke_operation(self):
         try:
-            self.logger.info ("PublisherAppln::invoke_operation")   
-            if (self.state == self.State.REGISTER):
-                # send a register msg to discovery service
-                self.logger.debug ("PublisherAppln::invoke_operation - register with the discovery service")
-                self.mw_obj.register (self.name, self.topiclist)
+            if self.state == self.State.REGISTER:
+                self.logger.info("PublisherAppln::invoke_operation - Registering with Discovery")
+                self.mw_obj.register(self.name, self.topiclist)
                 return None
-            elif (self.state == self.State.DISSEMINATE):
-                self.logger.info ("PublisherAppln::invoke_operation - start Disseminating")
-                ts = TopicSelector ()
-                for i in range (self.iters):
+
+            elif self.state == self.State.DISSEMINATE:
+                # Instead of running all iterations at once, just do one iteration per call
+                self.logger.info("PublisherAppln::invoke_operation - Disseminating")
+                
+                # If we have iterations left, disseminate one batch of topics
+                if hasattr(self, 'current_iteration') and self.current_iteration < self.iters:
+                    ts = TopicSelector()
                     for topic in self.topiclist:
-                        dissemination_data = ts.gen_publication (topic)
-                        self.mw_obj.disseminate (self.name, topic, dissemination_data)
-                time.sleep (1/float (self.frequency))  # ensure we get a floating point num
-                self.logger.info ("PublisherAppln::invoke_operation - Dissemination completed")
-                self.state = self.State.COMPLETED
-                return 0
-            elif (self.state == self.State.COMPLETED):
-                self.mw_obj.disable_event_loop ()
-                return None
+                        dissemination_data = ts.gen_publication(topic)
+                        self.mw_obj.disseminate(self.name, topic, dissemination_data)
+                    
+                    self.current_iteration += 1
+                    self.logger.info(f"Published iteration {self.current_iteration}/{self.iters}")
+                    
+                    # Return a timeout based on the frequency (in milliseconds)
+                    return int(1000/float(self.frequency))
+                
+                # If we're done with all iterations, complete
+                elif hasattr(self, 'current_iteration') and self.current_iteration >= self.iters:
+                    self.logger.info("PublisherAppln::invoke_operation - Dissemination completed")
+                    self.state = self.State.COMPLETED
+                    return 0
+                
+                # First call to disseminate, initialize the counter
+                else:
+                    self.current_iteration = 0
+                    return 0  # Call us right back to start the first iteration
+
             else:
-                raise ValueError ("Undefined state of the appln object")
-            self.logger.info ("PublisherAppln::invoke_operation completed")
+                self.logger.info("PublisherAppln::invoke_operation - Completed")
+                return None
+
         except Exception as e:
+            self.logger.error(f"Exception in invoke_operation: {e}")
             raise e
 
     def register_response(self, reg_resp):
