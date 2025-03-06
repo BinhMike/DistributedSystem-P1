@@ -24,6 +24,7 @@ class PublisherMW:
         self.poller = None
         self.discovery_addr = None
         self.upcall_obj = None
+        self.handle_events = True
 
     def configure(self, discovery_addr, pub_port, pub_addr):
         ''' Configure middleware '''
@@ -68,7 +69,7 @@ class PublisherMW:
     def event_loop(self, timeout=None):
         try:
             self.logger.info("PublisherMW::event_loop - running")
-            while True:
+            while self.handle_events:
                 events = dict(self.poller.poll(timeout=timeout))
 
                 if not events:
@@ -109,20 +110,24 @@ class PublisherMW:
             raise e
     def disseminate (self, id, topic, data):
         try:
-            self.logger.debug ("PublisherMW::disseminate")
+            self.logger.info ("PublisherMW::disseminate")
 
             # Now use the protobuf logic to encode the info and send it.  But for now
             # we are simply sending the string to make sure dissemination is working.
             timestamp = time.time()  # add time stamp
             send_str = f"{topic}:{timestamp}:{data}"  
-            self.logger.debug (f"PublisherMW::disseminate - {send_str}")
+            self.logger.info (f"PublisherMW::disseminate - {send_str}")
 
             # send the info as bytes. See how we are providing an encoding of utf-8
             self.pub.send (bytes(send_str, "utf-8"))
 
-            self.logger.debug ("PublisherMW::disseminate complete")
+            self.logger.info ("PublisherMW::disseminate complete")
         except Exception as e:
             raise e
 
     def set_upcall_handle(self, upcall_obj):
         self.upcall_obj = upcall_obj
+
+    def disable_event_loop (self):
+        ''' disable event loop '''
+        self.handle_events = False

@@ -96,39 +96,32 @@ class PublisherAppln:
         except Exception as e:
             raise e
 
-    def invoke_operation(self):
+    def invoke_operation (self):
+        ''' Invoke operating depending on state  '''
         try:
-            if self.state == self.State.REGISTER:
-                self.logger.info("PublisherAppln::invoke_operation - Registering with Discovery")
-                self.mw_obj.register(self.name, self.topiclist)
+            self.logger.info ("PublisherAppln::invoke_operation")   
+            if (self.state == self.State.REGISTER):
+                # send a register msg to discovery service
+                self.logger.debug ("PublisherAppln::invoke_operation - register with the discovery service")
+                self.mw_obj.register (self.name, self.topiclist)
                 return None
-
-            elif self.state == self.State.DISSEMINATE:
-                # We are here because both registration and is ready is done. So the only thing
-                # left for us as a publisher is dissemination, which we do it actively here.
+            elif (self.state == self.State.DISSEMINATE):
                 self.logger.info ("PublisherAppln::invoke_operation - start Disseminating")
-
-                # Now disseminate topics at the rate at which we have configured ourselves.
                 ts = TopicSelector ()
                 for i in range (self.iters):
-                # I leave it to you whether you want to disseminate all the topics of interest in
-                # each iteration OR some subset of it. Please modify the logic accordingly.
-                # Here, we choose to disseminate on all topics that we publish.  Also, we don't care
-                # about their values. But in future assignments, this can change.
                     for topic in self.topiclist:
-                        # For now, we have chosen to send info in the form "topic name: topic value"
-                        # In later assignments, we should be using more complex encodings using
-                        # protobuf.  In fact, I am going to do this once my basic logic is working.
                         dissemination_data = ts.gen_publication (topic)
                         self.mw_obj.disseminate (self.name, topic, dissemination_data)
-
-                # Now sleep for an interval of time to ensure we disseminate at the
-                # frequency that was configured.
                 time.sleep (1/float (self.frequency))  # ensure we get a floating point num
-
+                self.logger.info ("PublisherAppln::invoke_operation - Dissemination completed")
                 self.state = self.State.COMPLETED
                 return 0
-
+            elif (self.state == self.State.COMPLETED):
+                self.mw_obj.disable_event_loop ()
+                return None
+            else:
+                raise ValueError ("Undefined state of the appln object")
+            self.logger.info ("PublisherAppln::invoke_operation completed")
         except Exception as e:
             raise e
 
