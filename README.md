@@ -13,12 +13,16 @@ python3 SubscriberAppln.py -n sub1 -z localhost:2181 -T 9 -l 20
 
 Start Zookeeper:
 To start a new Zookeeper:
+
 ./zkServer.sh start
 
 To run Zookeeper:
 ./zkCli.sh
+
 ls /discovery/leader
+
 ls /subscribers
+
 ls /publishers
 
 If you want to see the data stored in a particular node:
