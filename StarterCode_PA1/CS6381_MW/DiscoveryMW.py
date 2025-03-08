@@ -18,9 +18,9 @@ class DiscoveryMW:
     ########################################
     def __init__(self, logger, zk_client):
         self.logger = logger
-        self.zk = zk_client  # ZooKeeper client
-        self.rep = None  # REP socket for handling requests
-        self.upcall_obj = None  # Application logic handle
+        self.zk = zk_client        # ZooKeeper client (shared with the application)
+        self.rep = None            # REP socket for handling requests
+        self.upcall_obj = None     # Application logic handle
 
     ########################################
     # Configure Middleware
@@ -49,27 +49,41 @@ class DiscoveryMW:
         ''' Forever loop waiting for requests '''
         try:
             self.logger.info("DiscoveryMW::event_loop - running")
-
             while True:
                 # Wait for a request
                 bytes_received = self.rep.recv()
-
+                self.logger.debug("DiscoveryMW::event_loop - Received request")
                 # Deserialize request
                 disc_req = discovery_pb2.DiscoveryReq()
                 disc_req.ParseFromString(bytes_received)
+                # If this instance is not primary, it may choose not to serve requests.
+                if not self.upcall_obj.is_primary:
+                    self.logger.warning("Not primary. Rejecting request.")
+                    response = discovery_pb2.DiscoveryResp()
+                    response.msg_type = disc_req.msg_type
+                    # Define a STATUS_NOT_PRIMARY in proto file.
+                    response.register_resp.status = discovery_pb2.STATUS_NOT_PRIMARY
+                    self.rep.send(response.SerializeToString())
+                    continue
 
-                # Determine message type and handle accordingly
+                # Process requests if primary
                 if disc_req.msg_type == discovery_pb2.TYPE_REGISTER:
                     response = self.upcall_obj.register(disc_req.register_req)
                 elif disc_req.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
                     response = self.upcall_obj.lookup(disc_req.lookup_req)
-
+                else:
+                    self.logger.error("DiscoveryMW::event_loop - Unknown request type")
+                    response = discovery_pb2.DiscoveryResp()
+                    response.msg_type = discovery_pb2.TYPE_UNKNOWN
                 # Serialize and send the response
                 self.rep.send(response.SerializeToString())
 
         except Exception as e:
             raise e
 
+    ########################################
+    # Set Upcall Handle
+    ########################################
     def set_upcall_handle(self, upcall_obj):
         ''' Save reference to the application logic '''
         self.upcall_obj = upcall_obj
