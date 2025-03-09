@@ -75,20 +75,21 @@ class SubscriberAppln:
         return None
 
     def lookup_response(self, lookup_resp):
-        """ Subscribe to publishers that disseminate the selected topics """
+        """ Subscribe to publishers/brokers  that disseminate the selected topics """
+        """ Subscriber receive either publisher or broker address msg, which depends on discovery."""
         try:
             self.logger.info("SubscriberAppln::lookup_response")
             
             # Example using Direct strategy (like your pre-ZK version)
             if not lookup_resp.publishers:
-                self.logger.error("No publishers found")
+                self.logger.error("No publishers/brokers found")
                 return 1
 
             # Connect to each publisher
             for pub in lookup_resp.publishers:
                 if pub.addr and pub.port:
                     pub_address = f"tcp://{pub.addr}:{pub.port}"
-                    self.logger.info(f"Connecting to publisher at {pub_address}")
+                    self.logger.info(f"Connecting to {pub_address}")
                     self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
             
             self.logger.info("Moving to LISTENING state")

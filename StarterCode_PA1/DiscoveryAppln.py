@@ -40,6 +40,10 @@ class DiscoveryAppln:
             config = configparser.ConfigParser()
             config.read(args.config)
 
+            self.dissemination_strategy = config.get("Dissemination", "Strategy", fallback="Direct")
+            self.logger.info(f"Dissemination strategy set to: {self.dissemination_strategy}")
+    
+
             # Connect to ZooKeeper
             self.logger.info(f"Connecting to ZooKeeper at {args.zookeeper}")
             self.zk = KazooClient(hosts=args.zookeeper)
@@ -158,27 +162,35 @@ class DiscoveryAppln:
             # return an empty response or a status indicating non-primary.
             return response
 
-        matched_publishers = []
+        matched_nodes = []
+
+        # check dissemination strategy 
+        if self.dissemination_strategy == "Direct":
+            path = "/publishers"
+            self.logger.info("Direct mode: Looking up publishers")
+        else:
+            path = "/brokers"
+            self.logger.info("ViaBroker mode: Looking up brokers")
+
         try:
-            if not self.zk.exists("/publishers"):
-                self.logger.info("No publishers registered yet in ZooKeeper.")
-            else:
-                publishers = self.zk.get_children("/publishers")
-                self.logger.info(f"Found {len(publishers)} publishers in ZooKeeper")
-                for pub_id in publishers:
+            if self.zk.exists(path):
+            
+                nodes = self.zk.get_children(path)
+                self.logger.info(f"Found {len(nodes)} nodes in ZooKeeper")
+                for node_id in nodes:
                     try:
-                        data, _ = self.zk.get(f"/publishers/{pub_id}")
+                        data, _ = self.zk.get(f"{path}/{node_id}")
                         addr, port = data.decode().split(":")
-                        pub_info = discovery_pb2.RegistrantInfo(id=pub_id, addr=addr, port=int(port))
-                        matched_publishers.append(pub_info)
+                        node_info = discovery_pb2.RegistrantInfo(id=node_id, addr=addr, port=int(port))
+                        matched_nodes.append(node_info)
                     except Exception as e:
-                        self.logger.error(f"Error retrieving publisher {pub_id}: {str(e)}")
+                        self.logger.error(f"Error retrieving publisher {node_id}: {str(e)}")
         except Exception as e:
             self.logger.error(f"Error during lookup: {str(e)}")
 
         response = discovery_pb2.DiscoveryResp()
         response.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
-        response.lookup_resp.publishers.extend(matched_publishers)
+        response.lookup_resp.publishers.extend(matched_nodes)
         return response
 
     ########################################
