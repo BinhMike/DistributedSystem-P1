@@ -8,8 +8,12 @@ python3 DiscoveryAppln.py -p 5555 -a localhost -z localhost:2181
 Run the Publisher:
 python3 PublisherAppln.py -n pub1 -a localhost -p 5577 -z localhost:2181 -T 2 -f 1 -i 1000 -l 20
 
-Run the Subscriber:
+Run the borker:
+python3 BrokerAppln.py -n broker1 -p 6000 --addr localhost -z localhost:2181
+
+Run the subscriber：
 python3 SubscriberAppln.py -n sub1 -z localhost:2181 -T 9 -l 20
+
 
 Start Zookeeper:
 To start a new Zookeeper:
