@@ -70,20 +70,33 @@ class BrokerAppln():
         try:
             self.logger.info("BrokerAppln::driver - starting event loop")
             self.mw_obj.set_upcall_handle(self)
-            self.mw_obj.event_loop(timeout=0)  # enter event loop
+            
+            # Main event loop
+            while True:
+                # Process any network events (with timeout)
+                self.mw_obj.event_loop(timeout=100)  # 100ms timeout
+                
+                # Explicitly check for messages to forward (non-blocking)
+                self.invoke_operation()
+                
+                # Small sleep to prevent CPU spinning
+                time.sleep(0.01)
+                
         except Exception as e:
             self.logger.error(f"BrokerAppln::driver - error: {str(e)}")
             self.cleanup()
 
-
     def invoke_operation(self):
         """ Invoke operation for message forwarding """
         try:
-            self.logger.info("BrokerAppln::invoke_operation - dispatching messages")
-            self.mw_obj.forward_messages()
+            # Check for and forward any available messages (non-blocking)
+            result = self.mw_obj.forward_messages()
+            if result:
+                self.logger.debug("BrokerAppln::invoke_operation - message forwarded successfully")
             return None
         except Exception as e:
-            raise e
+            self.logger.error(f"BrokerAppln::invoke_operation - error: {str(e)}")
+            return None
     
 
     def signal_handler(self, signum, frame):

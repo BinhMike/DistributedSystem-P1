@@ -47,10 +47,19 @@ class BrokerMW():
         self.port = args.port
         self.logger.info("BrokerMW::configure")
         self.sub = self.context.socket(zmq.SUB) # Set sub
+        
+        # Subscribe to all topics by default
+        self.sub.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.logger.info("BrokerMW::configure - subscribed to all topics")
+        
         self.pub = self.context.socket(zmq.PUB) # Set pub
 
         self.logger.debug("BrokerMW::configure - binding PUB socket")
         self.pub.bind(f"tcp://*:{args.port}")
+
+        # Add more verbose logging about socket setup
+        self.logger.info(f"BrokerMW::configure - PUB socket bound to tcp://*:{args.port}")
+        self.logger.info(f"BrokerMW::configure - External address advertised as {self.addr}:{self.port}")
 
         # register Broker to ZooKeeper
         broker_address = f"{self.addr}:{self.port}"
@@ -72,23 +81,25 @@ class BrokerMW():
         # Listening to the change of publisher list. Trigger handle_publisher_change if there is a change
         self.zk.ChildrenWatch(self.publisher_path, self.handle_publisher_change)
 
-        
-  
-       
-
-
-    
     def subscribe_to_publishers(self):
         '''  Request and connect to publishers'''
+        self.logger.info("BrokerMW::subscribe_to_publishers - Checking for publishers in ZooKeeper")
+    
         if self.zk.exists(self.publisher_path):
             publishers = self.zk.get_children(self.publisher_path) # return a publisher ID list
+            self.logger.info(f"BrokerMW::subscribe_to_publishers - Found {len(publishers)} publishers: {publishers}")
+        
             for pub_id in publishers:
                 pub_data, stat = self.zk.get(f"{self.publisher_path}/{pub_id}") # return pubdata and Znodestat
                 pub_address = pub_data.decode() # publisher tcp address
-                self.sub.connect(f"tcp://{pub_address}")
-                self.logger.info(f"Connected to Publisher {pub_id} at {pub_address}")
+                connection_url = f"tcp://{pub_address}"
+                self.sub.connect(connection_url)
+                self.logger.info(f"BrokerMW::subscribe_to_publishers - Connected to Publisher {pub_id} at {connection_url}")
+        else:
+            self.logger.warning(f"BrokerMW::subscribe_to_publishers - Path {self.publisher_path} doesn't exist yet")
 
         self.poller.register(self.sub, zmq.POLLIN)  # listen to publishers
+        self.logger.info("BrokerMW::subscribe_to_publishers - SUB socket registered with poller")
 
 
     def handle_publisher_change(self, children):
@@ -107,7 +118,7 @@ class BrokerMW():
                     pub_data, stat = self.zk.get(f"{self.publisher_path}/{pub_id}")
                     pub_address = pub_data.decode()
                     new_sub.connect(f"tcp://{pub_address}")
-                    self.logger.info(f"Connected to Publisher {pub_id} at {pub_address}")
+                    self.logger.info(f"BrokerMW::handle_publisher_change - Connected to Publisher {pub_id} at {pub_address}")
                 except Exception as e:
                     self.logger.error(f"Error connecting to publisher {pub_id}: {str(e)}")
         
@@ -124,52 +135,51 @@ class BrokerMW():
         self.poller.register(self.sub, zmq.POLLIN)
 
     def forward_messages(self):
-        ''' Forward messages with error handling '''
+        ''' Forward messages from publishers to subscribers '''
         try:
-            # Receive message from publisher
-            message = self.sub.recv_string(flags=zmq.NOBLOCK)
-            if message:
-                # Log and forward message
-                self.logger.debug(f"BrokerMW::forward_messages - received: {message}")
-                self.pub.send_string(message)
-                return True
+            # Check if we have any messages to forward (non-blocking)
+            events = dict(self.poller.poll(timeout=0))
+            
+            if self.sub in events:
+                # Receive message from publisher
+                topic_and_message = self.sub.recv_string()
                 
-        except zmq.ZMQError as e:
-            if e.errno == zmq.EAGAIN:
-                # No message available
-                pass
-            else:
-                self.logger.error(f"BrokerMW::forward_messages - ZMQ error: {str(e)}")
+                # Forward the message to all subscribers
+                self.logger.info(f"BrokerMW::forward_messages - Forwarding: {topic_and_message}")
+                self.pub.send_string(topic_and_message)
+                return True
+            return False
+                
         except Exception as e:
             self.logger.error(f"BrokerMW::forward_messages - error: {str(e)}")
-            
-        return False
+            return False
 
     def event_loop(self, timeout=None):
-        ''' Improved event loop with ZMQ Poller '''
+        ''' Process events for specified timeout then return control to application '''
         try:
-            self.logger.info("BrokerMW::event_loop")
+            # Use timeout directly in poll - this will allow the method to return after timeout
+            # so the application can do other things if needed
+            events = dict(self.poller.poll(timeout=timeout))
             
-            while self.handle_events:
-                try:
-                    # Poll for events with timeout
-                    events = dict(self.poller.poll(timeout=timeout))
+            if not events and self.upcall_obj:
+                # No events within timeout, let application decide what to do
+                return
+            
+            if self.sub in events and events[self.sub] == zmq.POLLIN:
+                # Message available, receive it
+                topic_and_message = self.sub.recv_string()
+                
+                # Forward the message immediately
+                self.logger.info(f"BrokerMW::event_loop - Received and forwarding: {topic_and_message}")
+                self.pub.send_string(topic_and_message)
+                
+                # Let the application know we processed something
+                if self.upcall_obj:
+                    self.upcall_obj.invoke_operation()
                     
-                    if not events:
-                        # No events, let application handle timeout
-                        timeout = self.upcall_obj.invoke_operation()
-                    elif self.sub in events:
-                        # Handle publisher messages
-                        self.forward_messages()
-                except zmq.ZMQError as e:
-                    # Handle socket errors that might occur during polling
-                    self.logger.error(f"ZMQ Error in polling: {str(e)}")
-                    # Short pause before retrying
-                    time.sleep(0.1)
-                        
         except Exception as e:
-            self.logger.error(f"BrokerMW::event_loop - error: {str(e)}")
-            raise e
+            self.logger.error(f"BrokerMW::event_loop - Exception: {str(e)}")
+            return
 
     def set_upcall_handle(self, upcall_obj): # upcall function same as in Publisher
         self.logger.info("BrokerMW::set_upcall_handle - setting upcall handle")
