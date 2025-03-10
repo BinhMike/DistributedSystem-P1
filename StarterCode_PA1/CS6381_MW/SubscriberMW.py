@@ -41,6 +41,9 @@ class SubscriberMW:
 
     def connect_to_discovery(self, discovery_addr):
         ''' Connects to Discovery '''
+        # Extract the address part if a lease expiry is appended
+        if "|" in discovery_addr:
+            discovery_addr = discovery_addr.split("|")[0]
         self.logger.info(f"SubscriberMW::connect_to_discovery - Connecting to Discovery at {discovery_addr}")
 
         # Only disconnect if we have a previous connection
