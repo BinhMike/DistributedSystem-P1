@@ -92,62 +92,36 @@ class BrokerMW():
 
 
     def handle_publisher_change(self, children):
-        ''' reconnect when publishers change '''
+        ''' Safely reconnect when publishers change '''
         self.logger.info(f"Publisher list changed: {children}")
-        self.sub.close()
-        self.sub = self.context.socket(zmq.SUB)
-        self.sub.setsockopt_string(zmq.SUBSCRIBE, "") # Receive all topics
-        self.subscribe_to_publishers()
-
-   
-
-
-
-# no need to use req-rep to connect to Discovery
-
-        # #req-rep
-        # self.req = self.context.socket(zmq.REQ)
-        # self.logger.debug("BrokerMW::configure - connecting to Discovery Service")
-        # self.req.connect(f"tcp://{args.discovery}")
-
-
-    # def register(self, name):
-    #     ''' Send registration requirment to Discovery Server '''
-    #     self.logger.info(f"BrokerMW::register - Registering Broker: {name}")
         
-    #     # Construct registrantInfo
-    #     reg_info = discovery_pb2.RegistrantInfo()
-    #     reg_info.id = name
-    #     reg_info.addr = self.addr  
-    #     reg_info.port = self.port 
-
-    #     # construct RegisterReq
-    #     register_req = discovery_pb2.RegisterReq()
-    #     register_req.role = discovery_pb2.ROLE_BOTH  # Broker type
-    #     register_req.info.CopyFrom(reg_info) 
-
-    #     # construct DiscoveryReq
-    #     disc_req = discovery_pb2.DiscoveryReq()
-    #     disc_req.msg_type = discovery_pb2.TYPE_REGISTER
-    #     disc_req.register_req.CopyFrom(register_req)
-
-    #     # Send registration message - Use disc_req instead of register_req
-    #     buf = disc_req.SerializeToString()  # Changed from register_req to disc_req
-    #     self.logger.debug(f"BrokerMW::register - Sending registration request: {buf}")
-    #     self.req.send(buf)
-
-    #     # wait for response
-    #     response = self.req.recv()
-    #     # parse response 
-    #     disc_resp = discovery_pb2.DiscoveryResp()  # Changed to DiscoveryResp
-    #     disc_resp.ParseFromString(response)
-    #     self.logger.debug(f"BrokerMW::register - Received response: {disc_resp.register_resp.status}")
-    #     return disc_resp.register_resp
-
-    def set_upcall_handle(self, upcall_obj): # upcall function same as in Publisher
-        self.logger.info("BrokerMW::set_upcall_handle - setting upcall handle")
-        self.upcall_obj = upcall_obj
-
+        # Create new socket before closing old one
+        new_sub = self.context.socket(zmq.SUB)
+        new_sub.setsockopt_string(zmq.SUBSCRIBE, "") # Receive all topics
+        
+        # Connect to all publishers with new socket
+        if self.zk.exists(self.publisher_path):
+            publishers = self.zk.get_children(self.publisher_path)
+            for pub_id in publishers:
+                try:
+                    pub_data, stat = self.zk.get(f"{self.publisher_path}/{pub_id}")
+                    pub_address = pub_data.decode()
+                    new_sub.connect(f"tcp://{pub_address}")
+                    self.logger.info(f"Connected to Publisher {pub_id} at {pub_address}")
+                except Exception as e:
+                    self.logger.error(f"Error connecting to publisher {pub_id}: {str(e)}")
+        
+        # Update the poller to use the new socket
+        try:
+            if self.sub:
+                self.poller.unregister(self.sub)
+                self.sub.close()
+        except Exception as e:
+            self.logger.error(f"Error unregistering old socket: {str(e)}")
+            
+        # Assign new socket and register with poller
+        self.sub = new_sub
+        self.poller.register(self.sub, zmq.POLLIN)
 
     def forward_messages(self):
         ''' Forward messages with error handling '''
@@ -176,42 +150,31 @@ class BrokerMW():
         try:
             self.logger.info("BrokerMW::event_loop")
             
-            while True:
-                # Poll for events with timeout
-                
-                events = dict(self.poller.poll(timeout=timeout))
-                
-                if not events:
-                    # No events, let application handle timeout
-                    timeout = self.upcall_obj.invoke_operation()
-                elif self.sub in events:
-                    # Handle publisher messages
-                    self.forward_messages()
+            while self.handle_events:
+                try:
+                    # Poll for events with timeout
+                    events = dict(self.poller.poll(timeout=timeout))
                     
+                    if not events:
+                        # No events, let application handle timeout
+                        timeout = self.upcall_obj.invoke_operation()
+                    elif self.sub in events:
+                        # Handle publisher messages
+                        self.forward_messages()
+                except zmq.ZMQError as e:
+                    # Handle socket errors that might occur during polling
+                    self.logger.error(f"ZMQ Error in polling: {str(e)}")
+                    # Short pause before retrying
+                    time.sleep(0.1)
+                        
         except Exception as e:
             self.logger.error(f"BrokerMW::event_loop - error: {str(e)}")
             raise e
 
-    # def handle_reply(self):
-    #     ''' Handle discovery service responses '''
-    #     try:
-    #         # Receive and parse response
-    #         response = self.req.recv()
-    #         disc_resp = discovery_pb2.DiscoveryResp()
-    #         disc_resp.ParseFromString(response)
-            
-    #         if disc_resp.msg_type == discovery_pb2.TYPE_REGISTER:
-    #             timeout = self.upcall_obj.register_response(disc_resp.register_resp)
-    #         else:
-    #             self.logger.warning(f"Unhandled response type: {disc_resp.msg_type}")
-    #             timeout = None
-                
-    #         return timeout
-            
-    #     except Exception as e:
-    #         self.logger.error(f"BrokerMW::handle_reply - error: {str(e)}")
-    #         raise e
-        
+    def set_upcall_handle(self, upcall_obj): # upcall function same as in Publisher
+        self.logger.info("BrokerMW::set_upcall_handle - setting upcall handle")
+        self.upcall_obj = upcall_obj
+
     def cleanup(self):
         ''' Clean shutdown of sockets '''
         try:
@@ -227,4 +190,4 @@ class BrokerMW():
         except Exception as e:
             self.logger.error(f"BrokerMW::cleanup - error: {str(e)}")
 
-    
+
