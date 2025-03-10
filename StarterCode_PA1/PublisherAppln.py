@@ -85,6 +85,11 @@ class PublisherAppln:
                     self.mw_obj.connect_to_discovery(self.discovery_addr)
                     self.register()
 
+    def register(self):
+        """Wrapper to register with Discovery via middleware."""
+        self.logger.info("PublisherAppln::register - re-registering with Discovery")
+        self.mw_obj.register(self.name, self.topiclist)
+        
     def driver(self):
         try:
             self.logger.info("PublisherAppln::driver")

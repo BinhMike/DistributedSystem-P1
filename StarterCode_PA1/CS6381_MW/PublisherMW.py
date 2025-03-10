@@ -51,7 +51,10 @@ class PublisherMW:
             raise e
 
     def connect_to_discovery(self, discovery_addr):
-      ''' Connects to Discovery '''
+      """Connect to the Discovery service using only the address part."""
+      # Extract the address part if a lease expiry is appended
+      if "|" in discovery_addr:
+          discovery_addr = discovery_addr.split("|")[0]
       self.logger.info(f"Connecting to Discovery at {discovery_addr}")
 
       # Only disconnect if the socket was already connected before
