@@ -1,17 +1,9 @@
-###############################################
-#
-# Author: Aniruddha Gokhale
-# Vanderbilt University
-#
-# Purpose: Discovery service using ZooKeeper with warm-passive replication
-#
-###############################################
-
 import sys
 import time
 import argparse
 import logging
 import configparser
+import threading
 from kazoo.client import KazooClient  # ZooKeeper client
 from kazoo.exceptions import NodeExistsError
 from CS6381_MW.DiscoveryMW import DiscoveryMW
@@ -26,23 +18,35 @@ class DiscoveryAppln:
         self.mw_obj = None        # Middleware handle
         self.zk = None            # ZooKeeper client
         self.registry = {"publishers": {}, "subscribers": {}, "brokers": {}}
-        self.is_primary = False   # Will be set True if this instance becomes leader
+        self.is_primary = False   # True if this instance becomes leader
         self.leader_path = "/discovery/leader"
+        # Lease settings (in seconds)
+        self.lease_duration = 30          # How long each lease is valid
+        self.lease_renew_interval = 10    # How frequently to renew the lease
+        self.max_leader_duration = 120    # Maximum time this instance can remain primary
+        self.leader_start_time = None     # Time when this instance became leader
+        self.lease_thread = None          # Thread for lease renewal
 
     ########################################
     # Configure Discovery Application
     ########################################
     def configure(self, args):
-        ''' Configure the Discovery Application with warm-passive replication '''
+        """ Configure the Discovery Application with warm-passive replication and lease support """
         try:
             self.logger.info("DiscoveryAppln::configure")
-            # Parse configuration file
-            config = configparser.ConfigParser()
-            config.read(args.config)
+            config_obj = configparser.ConfigParser()
+            config_obj.read(args.config)
 
-            self.dissemination_strategy = config.get("Dissemination", "Strategy", fallback="Direct")
+            self.dissemination_strategy = config_obj.get("Dissemination", "Strategy", fallback="Direct")
             self.logger.info(f"Dissemination strategy set to: {self.dissemination_strategy}")
-    
+
+            # Optionally read lease settings from config - currently go with default values
+            # if config_obj.has_option("Discovery", "lease_duration"):
+            #     self.lease_duration = config_obj.getint("Discovery", "lease_duration")
+            # if config_obj.has_option("Discovery", "lease_renew_interval"):
+            #     self.lease_renew_interval = config_obj.getint("Discovery", "lease_renew_interval")
+            # if config_obj.has_option("Discovery", "max_leader_duration"):
+            #     self.max_leader_duration = config_obj.getint("Discovery", "max_leader_duration")
 
             # Connect to ZooKeeper
             self.logger.info(f"Connecting to ZooKeeper at {args.zookeeper}")
@@ -55,22 +59,31 @@ class DiscoveryAppln:
 
             # Attempt to become the leader by creating the ephemeral leader node.
             discovery_address = f"{args.addr}:{args.port}"
+            # Prepare leader data: address and lease expiry timestamp
+            lease_expiry = time.time() + self.lease_duration
+            leader_data = f"{discovery_address}|{lease_expiry}"
             try:
-                self.zk.create(self.leader_path, discovery_address.encode(), ephemeral=True)
+                self.zk.create(self.leader_path, leader_data.encode(), ephemeral=True)
                 self.is_primary = True
-                self.logger.info(f"Instance {discovery_address} became primary (leader).")
+                self.leader_start_time = time.time()  # Record when we became leader
+                self.logger.info(f"Instance {discovery_address} became primary with lease expiring at {lease_expiry}.")
+                self.start_lease_renewal(discovery_address)
             except NodeExistsError:
                 self.is_primary = False
                 self.logger.info("A leader already exists. Running as backup.")
-                # Set a watch on the leader node so that if it disappears we try to become primary.
+                # Watch for leader znode deletion so backup can try to become primary.
                 @self.zk.DataWatch(self.leader_path)
                 def watch_leader(data, stat, event):
                     if event is not None and event.type == "DELETED":
                         self.logger.info("Leader znode deleted. Attempting to become primary...")
                         try:
-                            self.zk.create(self.leader_path, discovery_address.encode(), ephemeral=True)
+                            new_expiry = time.time() + self.lease_duration
+                            new_data = f"{discovery_address}|{new_expiry}"
+                            self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
                             self.is_primary = True
-                            self.logger.info("This instance has now become the primary!")
+                            self.leader_start_time = time.time()  # Reset the leader start time
+                            self.logger.info(f"This instance has now become the primary with lease expiring at {new_expiry}!")
+                            self.start_lease_renewal(discovery_address)
                         except NodeExistsError:
                             self.logger.info("Another instance became primary.")
                             self.is_primary = False
@@ -96,6 +109,42 @@ class DiscoveryAppln:
             raise e
 
     ########################################
+    # Lease Renewal Thread
+    ########################################
+    def start_lease_renewal(self, discovery_address):
+        """Start a background thread to renew the lease periodically, but relinquish leadership after max duration."""
+        if self.lease_thread and self.lease_thread.is_alive():
+            self.logger.info("Lease renewal thread already running.")
+            return
+
+        def renew_lease():
+            while self.is_primary:
+                # Check if maximum leader duration has been reached.
+                if time.time() - self.leader_start_time >= self.max_leader_duration:
+                    self.logger.info("Max leader duration reached. Relinquishing primary role.")
+                    try:
+                        self.zk.delete(self.leader_path)
+                        self.logger.info("Deleted leader znode to relinquish leadership.")
+                    except Exception as e:
+                        self.logger.error(f"Error deleting leader znode: {str(e)}")
+                    self.is_primary = False
+                    break
+
+                time.sleep(self.lease_renew_interval)
+                new_expiry = time.time() + self.lease_duration
+                new_data = f"{discovery_address}|{new_expiry}"
+                try:
+                    self.zk.set(self.leader_path, new_data.encode())
+                    self.logger.info(f"Lease renewed; new expiry time: {new_expiry}")
+                except Exception as e:
+                    self.logger.error(f"Failed to renew lease: {str(e)}")
+                    break
+
+        import threading  # Ensure threading is imported
+        self.lease_thread = threading.Thread(target=renew_lease, daemon=True)
+        self.lease_thread.start()
+
+    ########################################
     # Handle Registration Request
     ########################################
     def register(self, register_req):
@@ -109,12 +158,12 @@ class DiscoveryAppln:
         entity_id = register_req.info.id
         self.logger.info(f"Registering {role}: {entity_id}")
 
-        # If this instance is not primary, then respond with a not-primary status.
+        # If not primary, then respond with not-primary status.
         if not self.is_primary:
             self.logger.warning("Not primary; cannot process registration. Inform client to contact the leader.")
             response = discovery_pb2.DiscoveryResp()
             response.msg_type = discovery_pb2.TYPE_REGISTER
-            response.register_resp.status = discovery_pb2.STATUS_NOT_PRIMARY  # Define this status in your proto.
+            response.register_resp.status = discovery_pb2.STATUS_NOT_PRIMARY
             return response
 
         # Otherwise, proceed to register the entity in ZooKeeper.
@@ -136,7 +185,6 @@ class DiscoveryAppln:
             response.register_resp.status = discovery_pb2.STATUS_FAILURE
             return response
 
-        # Store registration locally
         self.registry[category][entity_id] = {
             "addr": register_req.info.addr,
             "port": register_req.info.port,
@@ -159,12 +207,10 @@ class DiscoveryAppln:
             self.logger.warning("Not primary; lookup request cannot be processed here.")
             response = discovery_pb2.DiscoveryResp()
             response.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
-            # return an empty response or a status indicating non-primary.
             return response
 
         matched_nodes = []
 
-        # check dissemination strategy 
         if self.dissemination_strategy == "Direct":
             path = "/publishers"
             self.logger.info("Direct mode: Looking up publishers")
@@ -174,9 +220,8 @@ class DiscoveryAppln:
 
         try:
             if self.zk.exists(path):
-            
                 nodes = self.zk.get_children(path)
-                self.logger.info(f"Found {len(nodes)} nodes in ZooKeeper")
+                self.logger.info(f"Found {len(nodes)} nodes in ZooKeeper under {path}")
                 for node_id in nodes:
                     try:
                         data, _ = self.zk.get(f"{path}/{node_id}")
@@ -184,7 +229,7 @@ class DiscoveryAppln:
                         node_info = discovery_pb2.RegistrantInfo(id=node_id, addr=addr, port=int(port))
                         matched_nodes.append(node_info)
                     except Exception as e:
-                        self.logger.error(f"Error retrieving publisher {node_id}: {str(e)}")
+                        self.logger.error(f"Error retrieving node {node_id}: {str(e)}")
         except Exception as e:
             self.logger.error(f"Error during lookup: {str(e)}")
 
@@ -232,7 +277,7 @@ def parseCmdLineArgs():
     parser.add_argument("-a", "--addr", default="localhost", help="IP address of Discovery Service")
     parser.add_argument("-z", "--zookeeper", default="127.0.0.1:2181", help="ZooKeeper address (default: 127.0.0.1:2181)")
     parser.add_argument("-c", "--config", default="config.ini", help="Configuration file (default: config.ini)")
-    parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, choices=[10, 20, 30, 40, 50], help="Logging level")
+    parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, choices=[10,20,30,40,50], help="Logging level")
     return parser.parse_args()
 
 
@@ -240,12 +285,13 @@ def parseCmdLineArgs():
 # Main function
 ###################################
 def main():
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logger = logging.getLogger("DiscoveryAppln")
     args = parseCmdLineArgs()
     logger.setLevel(args.loglevel)
     app = DiscoveryAppln(logger)
-    app.configure(args)  # `args` now includes the ZooKeeper address
+    app.configure(args)
     app.run()
 
 if __name__ == "__main__":
