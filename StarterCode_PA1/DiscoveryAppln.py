@@ -21,9 +21,9 @@ class DiscoveryAppln:
         self.is_primary = False   # True if this instance becomes leader
         self.leader_path = "/discovery/leader"
         # Lease settings (in seconds)
-        self.lease_duration = 30          # How long each lease is valid
+        self.lease_duration = 10          # How long each lease is valid
         self.lease_renew_interval = 10    # How frequently to renew the lease
-        self.max_leader_duration = 120    # Maximum time this instance can remain primary
+        self.max_leader_duration = 30    # Maximum time this instance can remain primary
         self.leader_start_time = None     # Time when this instance became leader
         self.lease_thread = None          # Thread for lease renewal
 
@@ -76,16 +76,29 @@ class DiscoveryAppln:
                 def watch_leader(data, stat, event):
                     if event is not None and event.type == "DELETED":
                         self.logger.info("Leader znode deleted. Attempting to become primary...")
+                        # Add a small delay to avoid race conditions
+                        time.sleep(1)
                         try:
-                            new_expiry = time.time() + self.lease_duration
-                            new_data = f"{discovery_address}|{new_expiry}"
-                            self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
-                            self.is_primary = True
-                            self.leader_start_time = time.time()  # Reset the leader start time
-                            self.logger.info(f"This instance has now become the primary with lease expiring at {new_expiry}!")
-                            self.start_lease_renewal(discovery_address)
+                            # Re-ensure the discovery path exists
+                            self.zk.ensure_path("/discovery")
+                            
+                            # Check if the leader node still doesn't exist
+                            if not self.zk.exists(self.leader_path):
+                                new_expiry = time.time() + self.lease_duration
+                                new_data = f"{discovery_address}|{new_expiry}"
+                                self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
+                                self.is_primary = True
+                                self.leader_start_time = time.time()  # Reset the leader start time
+                                self.logger.info(f"This instance has now become the primary with lease expiring at {new_expiry}!")
+                                self.start_lease_renewal(discovery_address)
+                            else:
+                                self.logger.info("Leader node already recreated by another instance.")
+                                self.is_primary = False
                         except NodeExistsError:
-                            self.logger.info("Another instance became primary.")
+                            self.logger.info("Another instance became primary while we were trying.")
+                            self.is_primary = False
+                        except Exception as e:
+                            self.logger.error(f"Error during leadership transition: {str(e)}")
                             self.is_primary = False
 
             # Log current leader information for debugging
@@ -123,8 +136,11 @@ class DiscoveryAppln:
                 if time.time() - self.leader_start_time >= self.max_leader_duration:
                     self.logger.info("Max leader duration reached. Relinquishing primary role.")
                     try:
-                        self.zk.delete(self.leader_path)
-                        self.logger.info("Deleted leader znode to relinquish leadership.")
+                        # Only delete the leader node, not the entire path
+                        if self.zk.exists(self.leader_path):
+                            self.zk.delete(self.leader_path)
+                            self.logger.info("Deleted leader znode to relinquish leadership.")
+                            time.sleep(1)
                     except Exception as e:
                         self.logger.error(f"Error deleting leader znode: {str(e)}")
                     self.is_primary = False
@@ -223,11 +239,23 @@ class DiscoveryAppln:
                 nodes = self.zk.get_children(path)
                 self.logger.info(f"Found {len(nodes)} nodes in ZooKeeper under {path}")
                 for node_id in nodes:
+                    # Skip any node named "leader" - it's not a publisher/subscriber/broker
+                    if node_id == "leader":
+                        self.logger.warning(f"Skipping 'leader' node found in {path}")
+                        continue
+                        
                     try:
                         data, _ = self.zk.get(f"{path}/{node_id}")
-                        addr, port = data.decode().split(":")
-                        node_info = discovery_pb2.RegistrantInfo(id=node_id, addr=addr, port=int(port))
-                        matched_nodes.append(node_info)
+                        node_data = data.decode()
+                        
+                        # Extra validation to ensure proper format
+                        if ":" in node_data:
+                            addr, port = node_data.split(":")
+                            node_info = discovery_pb2.RegistrantInfo(id=node_id, addr=addr, port=int(port))
+                            matched_nodes.append(node_info)
+                            self.logger.info(f"Added {node_id} at {addr}:{port} to response")
+                        else:
+                            self.logger.error(f"Node {node_id} has invalid data format: {node_data}")
                     except Exception as e:
                         self.logger.error(f"Error retrieving node {node_id}: {str(e)}")
         except Exception as e:
@@ -236,6 +264,7 @@ class DiscoveryAppln:
         response = discovery_pb2.DiscoveryResp()
         response.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
         response.lookup_resp.publishers.extend(matched_nodes)
+        self.logger.info(f"Returning {len(matched_nodes)} matches for topics {lookup_req.topiclist}")
         return response
 
     ########################################
