@@ -49,7 +49,6 @@ class BrokerMW():
         
 
     def configure(self, args):
-        self.logger.warning(f"⚠️ configure() CALLED! Args: {args}")
         self.args = args
         self.addr = args.addr  
         self.port = args.port
@@ -179,8 +178,7 @@ class BrokerMW():
             self.sync_followers_task = threading.Thread(target=self.periodic_follower_sync, daemon=True)
             self.sync_followers_task.start()
 
-            # self.configure(self.args)  # 这一步确保 leader 重新加载正确的配置
-            # self.logger.info("✅ Leader Broker reconfigured successfully!")
+            
 
 
         # if there already has a leader
