@@ -63,6 +63,9 @@ class BrokerAppln():
         self.zk.ensure_path(self.zk_path)
         broker_address = f"{args.addr}:{args.port}"
         
+        # Set up the leader watcher function - defined once to be reused
+        self.setup_leader_watch(broker_address)
+        
         # Attempt to become the leader broker by creating the ephemeral leader node
         lease_expiry = time.time() + self.lease_duration
         leader_data = f"{broker_address}|{lease_expiry}"
@@ -76,36 +79,6 @@ class BrokerAppln():
         except NodeExistsError:
             self.is_primary = False
             self.logger.info("A leader broker already exists. Running as backup.")
-            
-            # Watch for leader znode deletion so backup can try to become primary
-            @self.zk.DataWatch(self.leader_path)
-            def watch_leader(data, stat, event):
-                if event is not None and event.type == "DELETED":
-                    self.logger.info("Leader broker znode deleted. Attempting to become primary...")
-                    # Add a small delay to avoid race conditions
-                    time.sleep(1)
-                    try:
-                        # Re-ensure the brokers path exists
-                        self.zk.ensure_path(self.zk_path)
-                        
-                        # Check if the leader node still doesn't exist
-                        if not self.zk.exists(self.leader_path):
-                            new_expiry = time.time() + self.lease_duration
-                            new_data = f"{broker_address}|{new_expiry}"
-                            self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
-                            self.is_primary = True
-                            self.leader_start_time = time.time()  # Reset the leader start time
-                            self.logger.info(f"This broker has now become the primary with lease expiring at {new_expiry}!")
-                            self.start_lease_renewal(broker_address)
-                        else:
-                            self.logger.info("Leader node already recreated by another broker.")
-                            self.is_primary = False
-                    except NodeExistsError:
-                        self.logger.info("Another broker became primary while we were trying.")
-                        self.is_primary = False
-                    except Exception as e:
-                        self.logger.error(f"Error during leadership transition: {str(e)}")
-                        self.is_primary = False
         
         # Log current leader information for debugging
         if self.zk.exists(self.leader_path):
@@ -125,6 +98,43 @@ class BrokerAppln():
         self.mw_obj = BrokerMW(self.logger, self.zk, self.is_primary)  
         self.mw_obj.configure(args)  
         self.logger.info(f"BrokerAppln::configure - completed (Primary status: {self.is_primary})")
+
+    def setup_leader_watch(self, broker_address):
+        """Setup a watch on the leader node to detect failures"""
+        self.logger.info("Setting up watch on leader node")
+        
+        @self.zk.DataWatch(self.leader_path)
+        def watch_leader(data, stat, event):
+            if event is not None and event.type == "DELETED":
+                self.logger.info("Leader broker znode deleted. Attempting to become primary...")
+                # Add a small delay to avoid race conditions
+                time.sleep(1)
+                try:
+                    # Re-ensure the brokers path exists
+                    self.zk.ensure_path(self.zk_path)
+                    
+                    # Check if the leader node still doesn't exist
+                    if not self.zk.exists(self.leader_path):
+                        new_expiry = time.time() + self.lease_duration
+                        new_data = f"{broker_address}|{new_expiry}"
+                        self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
+                        self.is_primary = True
+                        self.leader_start_time = time.time()  # Reset the leader start time
+                        self.logger.info(f"This broker has now become the primary with lease expiring at {new_expiry}!")
+                        self.start_lease_renewal(broker_address)
+                        
+                        # Update middleware if it exists
+                        if self.mw_obj:
+                            self.mw_obj.update_primary_status(True)
+                    else:
+                        self.logger.info("Leader node already recreated by another broker.")
+                        self.is_primary = False
+                except NodeExistsError:
+                    self.logger.info("Another broker became primary while we were trying.")
+                    self.is_primary = False
+                except Exception as e:
+                    self.logger.error(f"Error during leadership transition: {str(e)}")
+                    self.is_primary = False
 
     def start_lease_renewal(self, broker_address):
         """Start a background thread to renew the lease periodically, but relinquish leadership after max duration."""
@@ -146,6 +156,9 @@ class BrokerAppln():
                         # Update our middleware's primary status
                         if self.mw_obj:
                             self.mw_obj.update_primary_status(False)
+                            
+                        # Make sure we're watching for leader changes when we give up leadership
+                        self.setup_leader_watch(broker_address)
                         return  # Exit the thread
                     except Exception as e:
                         self.logger.error(f"Error giving up leadership: {str(e)}")
@@ -172,6 +185,9 @@ class BrokerAppln():
                     self.is_primary = False
                     if self.mw_obj:
                         self.mw_obj.update_primary_status(False)
+                    
+                    # Re-setup the leader watch when we encounter errors
+                    self.setup_leader_watch(broker_address)
                     return  # Exit on error
                 
                 # Sleep until next renewal

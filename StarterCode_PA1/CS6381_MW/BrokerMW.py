@@ -143,6 +143,8 @@ class BrokerMW:
             self.logger.info(f"BrokerMW::update_primary_status - Status changed to: {'PRIMARY' if is_primary else 'BACKUP'}")
             if is_primary:
                 self.logger.info(f"BrokerMW::update_primary_status - Now primary, will start forwarding {len(self.message_buffer)} buffered messages")
+                # If we just became primary, start forwarding immediately
+                self.forward_messages()
             else:
                 self.logger.info("BrokerMW::update_primary_status - Now backup, will buffer incoming messages")
 
