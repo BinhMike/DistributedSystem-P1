@@ -60,10 +60,12 @@ class BrokerAppln():
         self.logger.info(f"Broker registered in ZooKeeper at {broker_node_path}")
 
 
+        
         # initialize middleware
-        self.mw_obj = BrokerMW(self.logger, self.zk)  
+        self.mw_obj = BrokerMW(self.logger, self.zk, False)  
         self.mw_obj.configure(args)  
         self.logger.info("BrokerAppln::configure - completed")
+
 
     def driver(self):
         # Starting event Loop
@@ -131,6 +133,7 @@ def parseCmdLineArgs():
 ###################################
 
 def main():
+    logging.getLogger("kazoo").setLevel(logging.WARNING)
     logger = logging.getLogger("BrokerAppln")
     args = parseCmdLineArgs()
     broker_app = BrokerAppln(logger)
