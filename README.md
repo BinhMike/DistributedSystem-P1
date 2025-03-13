@@ -19,6 +19,8 @@ python3 BrokerAppln.py -n broker1 -p 6000 --addr localhost -z localhost:2181
 
 python3 BrokerAppln.py -n broker2 -p 6001 --addr localhost -z localhost:2181
 
+python3 BrokerAppln.py -n broker3 -p 6002 --addr localhost -z localhost:2181
+
 
 Run the subscriber：
 python3 SubscriberAppln.py -n sub1 -z localhost:2181 -T 9 -l 20

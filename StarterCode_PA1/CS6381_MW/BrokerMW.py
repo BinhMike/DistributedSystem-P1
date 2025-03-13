@@ -29,6 +29,7 @@ import os
 from kazoo import exceptions
 from kazoo.exceptions import NodeExistsError
 from CS6381_MW import discovery_pb2  
+import random
 
 class BrokerMW():
     ########################################
@@ -663,39 +664,58 @@ class BrokerMW():
     # Revive Broker Replicas
     ########################################
     def revive_broker_replicas(self, count, revival_flag_path):
-        """Revive the specified number of broker replicas"""
+        """Revive the specified number of broker replicas using broker agents"""
         try:
             self.logger.info(f"BrokerMW::revive_broker_replicas - Reviving {count} broker replicas")
             
+            # First, find available broker agents
+            agents = self.get_available_broker_agents()
+            if not agents:
+                self.logger.error("BrokerMW::revive_broker_replicas - No broker agents available")
+                return
+                
+            self.logger.info(f"BrokerMW::revive_broker_replicas - Found {len(agents)} available broker agents")
+            
             # Get the next available port numbers
-            base_port = self.port + 1
+            base_port = 5556  # Starting port for brokers
+            
+            # Keep track of successful deployments
+            successful = 0
             
             # Revive each replica
             for i in range(count):
+                # Select an agent using round-robin or random selection
+                agent = agents[i % len(agents)] if len(agents) > 0 else agents[0]
                 new_port = base_port + i
                 replica_name = f"broker_replica_{int(time.time())}_{i}"
                 
-                self.logger.info(f"BrokerMW::revive_broker_replicas - Starting new replica {replica_name} on port {new_port}")
+                self.logger.info(f"BrokerMW::revive_broker_replicas - Requesting agent {agent['host']}:{agent['port']} to start new replica {replica_name}")
                 
-                # Prepare command to start a new broker instance
-                # Assuming BrokerAppln.py is in the same directory as this file
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                parent_dir = os.path.dirname(current_dir)
-                broker_script = os.path.join(parent_dir, "BrokerAppln.py")
+                # Connect to the agent
+                context = zmq.Context()
+                socket = context.socket(zmq.REQ)
+                socket.connect(f"tcp://{agent['host']}:{agent['port']}")
                 
-                # Build command with appropriate arguments
-                cmd = [
-                    "python3", 
-                    broker_script,
-                    "-n", replica_name,
-                    "-a", self.addr,
-                    "-p", str(new_port),
-                    "-z", self.args.zookeeper if hasattr(self.args, 'zookeeper') else "localhost:2181"
-                ]
+                # Send spawn request
+                request = {
+                    'action': 'spawn_broker',
+                    'name': replica_name,
+                    'port': new_port
+                }
                 
-                # Start the new broker process
-                subprocess.Popen(cmd)
-                self.logger.info(f"BrokerMW::revive_broker_replicas - Started process: {' '.join(cmd)}")
+                try:
+                    socket.send_json(request)
+                    response = socket.recv_json()
+                    
+                    if response['status'] == 'ok':
+                        self.logger.info(f"BrokerMW::revive_broker_replicas - Successfully started replica on {response['host']}:{response['port']}")
+                        successful += 1
+                    else:
+                        self.logger.error(f"BrokerMW::revive_broker_replicas - Failed to start replica: {response.get('message', 'Unknown error')}")
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::revive_broker_replicas - Error communicating with agent: {str(e)}")
+                
+                socket.close()
                 
                 # Wait briefly to allow the new broker to initialize
                 time.sleep(2)
@@ -708,10 +728,7 @@ class BrokerMW():
             if self.zk.exists(self.broker_path):
                 brokers = self.zk.get_children(self.broker_path)
                 broker_count = len([b for b in brokers if b != "leader"])
-                if broker_count >= self.quorum_size:
-                    self.logger.info(f"BrokerMW::revive_broker_replicas - Quorum restored ({broker_count}/{self.quorum_size})")
-                else:
-                    self.logger.warning(f"BrokerMW::revive_broker_replicas - Quorum not fully restored ({broker_count}/{self.quorum_size})")
+                self.logger.info(f"BrokerMW::revive_broker_replicas - Current broker count: {broker_count}/{self.quorum_size}")
             
         except Exception as e:
             self.logger.error(f"BrokerMW::revive_broker_replicas - Error: {str(e)}")
@@ -720,5 +737,39 @@ class BrokerMW():
             if self.zk.exists(revival_flag_path):
                 self.zk.delete(revival_flag_path)
             self.reviving = False
+
+    ########################################
+    # Get Available Broker Agents
+    ########################################
+    def get_available_broker_agents(self):
+        """Get a list of available broker agents from ZooKeeper"""
+        agents = []
+        agent_path = "/broker_agents"
+        
+        try:
+            # Ensure the path exists
+            self.zk.ensure_path(agent_path)
+            
+            # Get all registered agents
+            if self.zk.exists(agent_path):
+                agent_nodes = self.zk.get_children(agent_path)
+                
+                for node in agent_nodes:
+                    node_path = f"{agent_path}/{node}"
+                    data, _ = self.zk.get(node_path)
+                    host, port = data.decode().split(':')
+                    
+                    agents.append({
+                        'host': host,
+                        'port': int(port)
+                    })
+                    
+                self.logger.info(f"BrokerMW::get_available_broker_agents - Found {len(agents)} broker agents")
+                
+            return agents
+        
+        except Exception as e:
+            self.logger.error(f"BrokerMW::get_available_broker_agents - Error: {str(e)}")
+            return []
 
 
