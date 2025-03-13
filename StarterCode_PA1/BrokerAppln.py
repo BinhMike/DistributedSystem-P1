@@ -74,6 +74,7 @@ class BrokerAppln():
         except Exception as e:
             self.logger.error(f"BrokerAppln::driver - error: {str(e)}")
             self.cleanup()
+            return 
 
     def invoke_operation(self):
         """ Invoke operation for message forwarding """

@@ -24,6 +24,8 @@ import zmq
 import logging
 import time
 import threading
+import subprocess
+import os
 from kazoo import exceptions
 from kazoo.exceptions import NodeExistsError
 from CS6381_MW import discovery_pb2  
@@ -48,6 +50,7 @@ class BrokerMW():
         self.broker_path = "/brokers"
         self.leader_path = "/brokers/leader"
         self.publisher_path = "/publishers"
+        self.quorum_path = "/brokers/quorum"  # New path for quorum management
         
         # Leadership and replication
         self.is_primary = is_leader  # Initialize with provided value
@@ -59,6 +62,12 @@ class BrokerMW():
         self.lease_renew_interval = 5
         self.max_leader_duration = 30
         self.lease_thread = None
+        
+        # Quorum management
+        self.quorum_size = 3  # Target number of replicas
+        self.quorum_check_interval = 5  # Seconds between quorum checks
+        self.quorum_thread = None
+        self.reviving = False  # Flag to indicate if we're currently reviving a replica
 
     ########################################
     # Configure Middleware
@@ -98,6 +107,10 @@ class BrokerMW():
             
             # Watch for publisher changes
             self.zk.ChildrenWatch(self.publisher_path, self.handle_publisher_change)
+            
+            # Start quorum monitoring (only for primary)
+            if self.is_primary:
+                self.start_quorum_monitoring()
             
             self.logger.info("BrokerMW::configure - Configuration complete")
             
@@ -219,6 +232,9 @@ class BrokerMW():
                         # Start lease renewal and leader replication
                         self.start_lease_renewal(broker_address)
                         self.setup_leader_replication()
+                        
+                        # Start quorum monitoring (now that we're primary)
+                        self.start_quorum_monitoring()
                     else:
                         self.logger.info("BrokerMW::watch_leader_node - Leader node already recreated by another instance")
                         self.is_primary = False
@@ -484,6 +500,14 @@ class BrokerMW():
     def event_loop(self, timeout=None):
         """Process events for specified timeout then return control to application"""
         try:
+            # Check if quorum revival is in progress
+            revival_flag_path = f"{self.quorum_path}/revival_in_progress"
+            if self.zk.exists(revival_flag_path):
+                self.logger.warning("BrokerMW::event_loop - Quorum revival in progress, operations blocked")
+                time.sleep(1)  # Sleep briefly and return
+                return
+            
+            # Normal processing continues when not in revival
             # Poll for events with the specified timeout
             events = dict(self.poller.poll(timeout=timeout))
             
@@ -563,11 +587,138 @@ class BrokerMW():
             if hasattr(self, 'replication_listener') and self.replication_listener:
                 self.poller.unregister(self.replication_listener)
                 self.replication_listener.close()
+            
+            # Remove quorum revival flag if we created it
+            revival_flag_path = f"{self.quorum_path}/revival_in_progress"
+            if self.zk.exists(revival_flag_path):
+                try:
+                    data, stat = self.zk.get(revival_flag_path)
+                    self.zk.delete(revival_flag_path)
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::cleanup - Error removing revival flag: {str(e)}")
                 
             # Terminate ZMQ context
             self.context.term()
             
         except Exception as e:
             self.logger.error(f"BrokerMW::cleanup - Error: {str(e)}")
+
+    ########################################
+    # Start Quorum Monitoring
+    ########################################
+    def start_quorum_monitoring(self):
+        """Start monitoring the broker quorum to maintain 3 replicas"""
+        def quorum_monitoring_task():
+            self.logger.info("BrokerMW::quorum_monitoring_task - Starting quorum monitoring")
+            
+            while self.is_primary:
+                try:
+                    # Get current broker count
+                    broker_count = 0
+                    if self.zk.exists(self.broker_path):
+                        brokers = self.zk.get_children(self.broker_path)
+                        # Filter out the "leader" node which isn't a broker instance
+                        broker_count = len([b for b in brokers if b != "leader"])
+                    
+                    self.logger.info(f"BrokerMW::quorum_monitoring_task - Current broker count: {broker_count}")
+                    
+                    # Check if we need to revive brokers
+                    if broker_count < self.quorum_size and not self.reviving:
+                        self.logger.warning(f"BrokerMW::quorum_monitoring_task - Broker count below quorum ({broker_count}/{self.quorum_size})")
+                        
+                        # Number of brokers to revive
+                        to_revive = self.quorum_size - broker_count
+                        
+                        # Lock operations during revival
+                        self.reviving = True
+                        
+                        # Create a flag in ZooKeeper to indicate revival in progress
+                        self.zk.ensure_path(self.quorum_path)
+                        revival_flag_path = f"{self.quorum_path}/revival_in_progress"
+                        if not self.zk.exists(revival_flag_path):
+                            self.zk.create(revival_flag_path, b"true", ephemeral=True)
+                        
+                        # Start revival in a separate thread to avoid blocking monitor
+                        revival_thread = threading.Thread(
+                            target=self.revive_broker_replicas, 
+                            args=(to_revive, revival_flag_path),
+                            daemon=True
+                        )
+                        revival_thread.start()
+                    
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::quorum_monitoring_task - Error: {str(e)}")
+                
+                # Sleep before next check
+                time.sleep(self.quorum_check_interval)
+            
+            self.logger.info("BrokerMW::quorum_monitoring_task - Quorum monitoring stopped")
+        
+        # Start the monitoring thread
+        self.quorum_thread = threading.Thread(target=quorum_monitoring_task, daemon=True)
+        self.quorum_thread.start()
+        self.logger.info("BrokerMW::start_quorum_monitoring - Quorum monitoring thread started")
+
+    ########################################
+    # Revive Broker Replicas
+    ########################################
+    def revive_broker_replicas(self, count, revival_flag_path):
+        """Revive the specified number of broker replicas"""
+        try:
+            self.logger.info(f"BrokerMW::revive_broker_replicas - Reviving {count} broker replicas")
+            
+            # Get the next available port numbers
+            base_port = self.port + 1
+            
+            # Revive each replica
+            for i in range(count):
+                new_port = base_port + i
+                replica_name = f"broker_replica_{int(time.time())}_{i}"
+                
+                self.logger.info(f"BrokerMW::revive_broker_replicas - Starting new replica {replica_name} on port {new_port}")
+                
+                # Prepare command to start a new broker instance
+                # Assuming BrokerAppln.py is in the same directory as this file
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                parent_dir = os.path.dirname(current_dir)
+                broker_script = os.path.join(parent_dir, "BrokerAppln.py")
+                
+                # Build command with appropriate arguments
+                cmd = [
+                    "python3", 
+                    broker_script,
+                    "-n", replica_name,
+                    "-a", self.addr,
+                    "-p", str(new_port),
+                    "-z", self.args.zookeeper if hasattr(self.args, 'zookeeper') else "localhost:2181"
+                ]
+                
+                # Start the new broker process
+                subprocess.Popen(cmd)
+                self.logger.info(f"BrokerMW::revive_broker_replicas - Started process: {' '.join(cmd)}")
+                
+                # Wait briefly to allow the new broker to initialize
+                time.sleep(2)
+            
+            # Wait for brokers to register in ZooKeeper
+            self.logger.info("BrokerMW::revive_broker_replicas - Waiting for new brokers to register...")
+            time.sleep(5)
+            
+            # Check if we have reached the quorum
+            if self.zk.exists(self.broker_path):
+                brokers = self.zk.get_children(self.broker_path)
+                broker_count = len([b for b in brokers if b != "leader"])
+                if broker_count >= self.quorum_size:
+                    self.logger.info(f"BrokerMW::revive_broker_replicas - Quorum restored ({broker_count}/{self.quorum_size})")
+                else:
+                    self.logger.warning(f"BrokerMW::revive_broker_replicas - Quorum not fully restored ({broker_count}/{self.quorum_size})")
+            
+        except Exception as e:
+            self.logger.error(f"BrokerMW::revive_broker_replicas - Error: {str(e)}")
+        finally:
+            # Remove revival flag and reset reviving state
+            if self.zk.exists(revival_flag_path):
+                self.zk.delete(revival_flag_path)
+            self.reviving = False
 
 
