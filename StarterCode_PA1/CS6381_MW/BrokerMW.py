@@ -271,16 +271,21 @@ class BrokerMW():
                         self.zk.set(self.leader_path, new_data.encode())
                         self.logger.debug(f"BrokerMW::lease_renewal - Lease renewed, new expiry: {new_expiry}")
                     else:
-                        self.logger.warning("BrokerMW::lease_renewal - Leader node doesn't exist, recreating...")
+                        self.logger.warning("BrokerMW::lease_renewal - Leader node doesn't exist, attempting to reacquire leadership...")
+                        # Add a small delay to reduce race conditions
+                        time.sleep(1)
                         try:
                             new_expiry = time.time() + self.lease_duration
                             new_data = f"{broker_address}|{new_expiry}"
                             self.zk.ensure_path(self.broker_path)
                             self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
+                            self.is_primary = True
+                            self.primary_start_time = time.time()
+                            self.logger.info("BrokerMW::lease_renewal - Successfully re-elected as primary")
                         except NodeExistsError:
-                            self.logger.warning("BrokerMW::lease_renewal - Another instance became leader while renewing")
-                            self.is_primary = False
-                            break
+                            self.logger.warning("BrokerMW::lease_renewal - Another instance became primary; will retry shortly")
+                            time.sleep(1)
+                            continue
                         except Exception as e:
                             self.logger.error(f"BrokerMW::lease_renewal - Failed to recreate leader node: {str(e)}")
                             self.is_primary = False
@@ -688,21 +693,22 @@ class BrokerMW():
                 
             self.logger.info(f"BrokerMW::revive_broker_replicas - Found {len(agents)} available broker agents: {agents}")
             
-            # Revive each replica with timeouts
-            for i in range(count):
+            # Only use each agent once per revival cycle
+            brokers_to_revive = min(count, len(agents))
+            
+            for i in range(brokers_to_revive):
                 # Check if we've been trying too long
                 if time.time() - revival_start > 90:  # 90 second safety timeout
                     self.logger.error("BrokerMW::revive_broker_replicas - Revival taking too long, aborting")
                     break
                     
-                # Select an agent using round-robin
-                agent = agents[i % len(agents)]
-                new_port = 5556 + i
+                agent = agents[i]  # Use each agent only once
+                new_port = 5556 + i  # Assumes unique port assignment per broker
                 replica_name = f"broker_replica_{int(time.time())}_{i}"
                 
                 self.logger.info(f"BrokerMW::revive_broker_replicas - Requesting agent {agent['host']}:{agent['port']} to start replica {replica_name}")
                 
-                # Connect to the agent with timeout
+                # Connect to the agent with timeout settings
                 context = zmq.Context()
                 socket = context.socket(zmq.REQ)
                 socket.setsockopt(zmq.LINGER, 0)  # Don't wait on close
@@ -717,7 +723,7 @@ class BrokerMW():
                         'action': 'spawn_broker',
                         'name': replica_name,
                         'port': new_port,
-                        'zookeeper': self.args.zookeeper  # Make sure to pass ZK address
+                        'zookeeper': self.args.zookeeper  # Pass ZK address
                     }
                     
                     socket.send_json(request)
@@ -736,10 +742,10 @@ class BrokerMW():
         except Exception as e:
             self.logger.error(f"BrokerMW::revive_broker_replicas - Error: {str(e)}")
         finally:
-            # Make sure this always executes to clean up the flag
+            # Always remove the revival flag
             try:
                 if self.zk.exists(revival_flag_path):
-                    self.logger.info(f"BrokerMW::revive_broker_replicas - Removing revival flag")
+                    self.logger.info("BrokerMW::revive_broker_replicas - Removing revival flag")
                     self.zk.delete(revival_flag_path)
             except Exception as e:
                 self.logger.error(f"BrokerMW::revive_broker_replicas - Error removing revival flag: {str(e)}")
