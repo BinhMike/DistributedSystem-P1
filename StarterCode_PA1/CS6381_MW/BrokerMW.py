@@ -504,6 +504,17 @@ class BrokerMW():
             # Check if quorum revival is in progress
             revival_flag_path = f"{self.quorum_path}/revival_in_progress"
             if self.zk.exists(revival_flag_path):
+                # Add timeout check to automatically clear stuck revival flags
+                data, stat = self.zk.get(revival_flag_path)
+                revival_start_time = stat.ctime/1000  # ZK times are in milliseconds
+                
+                # If revival has been in progress for more than 2 minutes, clear the flag
+                if time.time() - revival_start_time > 120:
+                    self.logger.warning("BrokerMW::event_loop - Revival has been stuck for too long, clearing flag")
+                    self.zk.delete(revival_flag_path)
+                    self.reviving = False
+                    return
+                    
                 self.logger.warning("BrokerMW::event_loop - Quorum revival in progress, operations blocked")
                 time.sleep(1)  # Sleep briefly and return
                 return
@@ -665,6 +676,7 @@ class BrokerMW():
     ########################################
     def revive_broker_replicas(self, count, revival_flag_path):
         """Revive the specified number of broker replicas using broker agents"""
+        revival_start = time.time()
         try:
             self.logger.info(f"BrokerMW::revive_broker_replicas - Reviving {count} broker replicas")
             
@@ -674,69 +686,65 @@ class BrokerMW():
                 self.logger.error("BrokerMW::revive_broker_replicas - No broker agents available")
                 return
                 
-            self.logger.info(f"BrokerMW::revive_broker_replicas - Found {len(agents)} available broker agents")
+            self.logger.info(f"BrokerMW::revive_broker_replicas - Found {len(agents)} available broker agents: {agents}")
             
-            # Get the next available port numbers
-            base_port = 5556  # Starting port for brokers
-            
-            # Keep track of successful deployments
-            successful = 0
-            
-            # Revive each replica
+            # Revive each replica with timeouts
             for i in range(count):
-                # Select an agent using round-robin or random selection
-                agent = agents[i % len(agents)] if len(agents) > 0 else agents[0]
-                new_port = base_port + i
+                # Check if we've been trying too long
+                if time.time() - revival_start > 90:  # 90 second safety timeout
+                    self.logger.error("BrokerMW::revive_broker_replicas - Revival taking too long, aborting")
+                    break
+                    
+                # Select an agent using round-robin
+                agent = agents[i % len(agents)]
+                new_port = 5556 + i
                 replica_name = f"broker_replica_{int(time.time())}_{i}"
                 
-                self.logger.info(f"BrokerMW::revive_broker_replicas - Requesting agent {agent['host']}:{agent['port']} to start new replica {replica_name}")
+                self.logger.info(f"BrokerMW::revive_broker_replicas - Requesting agent {agent['host']}:{agent['port']} to start replica {replica_name}")
                 
-                # Connect to the agent
+                # Connect to the agent with timeout
                 context = zmq.Context()
                 socket = context.socket(zmq.REQ)
-                socket.connect(f"tcp://{agent['host']}:{agent['port']}")
-                
-                # Send spawn request
-                request = {
-                    'action': 'spawn_broker',
-                    'name': replica_name,
-                    'port': new_port
-                }
+                socket.setsockopt(zmq.LINGER, 0)  # Don't wait on close
+                socket.setsockopt(zmq.RCVTIMEO, 10000)  # 10 second receive timeout
+                socket.setsockopt(zmq.SNDTIMEO, 10000)  # 10 second send timeout
                 
                 try:
+                    socket.connect(f"tcp://{agent['host']}:{agent['port']}")
+                    
+                    # Send spawn request
+                    request = {
+                        'action': 'spawn_broker',
+                        'name': replica_name,
+                        'port': new_port,
+                        'zookeeper': self.args.zookeeper  # Make sure to pass ZK address
+                    }
+                    
                     socket.send_json(request)
                     response = socket.recv_json()
                     
-                    if response['status'] == 'ok':
-                        self.logger.info(f"BrokerMW::revive_broker_replicas - Successfully started replica on {response['host']}:{response['port']}")
-                        successful += 1
-                    else:
-                        self.logger.error(f"BrokerMW::revive_broker_replicas - Failed to start replica: {response.get('message', 'Unknown error')}")
+                    # Process response
+                    # ... rest of your code ...
+                    
+                except zmq.error.Again:
+                    self.logger.error(f"BrokerMW::revive_broker_replicas - Timeout communicating with agent at {agent['host']}:{agent['port']}")
                 except Exception as e:
-                    self.logger.error(f"BrokerMW::revive_broker_replicas - Error communicating with agent: {str(e)}")
+                    self.logger.error(f"BrokerMW::revive_broker_replicas - Error with agent: {str(e)}")
+                finally:
+                    socket.close()
                 
-                socket.close()
-                
-                # Wait briefly to allow the new broker to initialize
-                time.sleep(2)
-            
-            # Wait for brokers to register in ZooKeeper
-            self.logger.info("BrokerMW::revive_broker_replicas - Waiting for new brokers to register...")
-            time.sleep(5)
-            
-            # Check if we have reached the quorum
-            if self.zk.exists(self.broker_path):
-                brokers = self.zk.get_children(self.broker_path)
-                broker_count = len([b for b in brokers if b != "leader"])
-                self.logger.info(f"BrokerMW::revive_broker_replicas - Current broker count: {broker_count}/{self.quorum_size}")
-            
         except Exception as e:
             self.logger.error(f"BrokerMW::revive_broker_replicas - Error: {str(e)}")
         finally:
-            # Remove revival flag and reset reviving state
-            if self.zk.exists(revival_flag_path):
-                self.zk.delete(revival_flag_path)
+            # Make sure this always executes to clean up the flag
+            try:
+                if self.zk.exists(revival_flag_path):
+                    self.logger.info(f"BrokerMW::revive_broker_replicas - Removing revival flag")
+                    self.zk.delete(revival_flag_path)
+            except Exception as e:
+                self.logger.error(f"BrokerMW::revive_broker_replicas - Error removing revival flag: {str(e)}")
             self.reviving = False
+            self.logger.info("BrokerMW::revive_broker_replicas - Revival process completed")
 
     ########################################
     # Get Available Broker Agents

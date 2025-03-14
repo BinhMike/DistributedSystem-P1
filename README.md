@@ -28,7 +28,7 @@ Run the broker:
 
 (vm4)
 (primary) (need to run brokerAppln with --agent on all machines first, then start regular broker on 1 machine)
-python3 BrokerAppln.py -n broker1 -a 192.168.5.166 -p 5555 -z 192.168.5.91:2181
+python3 BrokerAppln.py -n broker1 -a 192.168.5.166 -p 5554 -z 192.168.5.91:2181
 
 python3 BrokerAppln.py --agent -a 192.168.5.166 -p 5555 -z 192.168.5.91:2181
 
