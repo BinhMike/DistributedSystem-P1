@@ -342,6 +342,11 @@ class BrokerMW():
             
             # Start thread to periodically update follower list
             self.get_follower_brokers()
+            
+            # Wait a brief moment for the socket to be fully established
+            time.sleep(0.1)
+            
+            # Start the follower sync thread only after replication socket is established
             self.sync_followers_task = threading.Thread(target=self.periodic_follower_sync, daemon=True)
             self.sync_followers_task.start()
             
@@ -533,7 +538,7 @@ class BrokerMW():
                 return
             
             # Handle messages from publishers
-            if self.sub in events:
+            if self.sub and self.sub in events:
                 # Receive the message
                 topic_and_message = self.sub.recv_string()
                 topic, message = topic_and_message.split(":", 1)
@@ -541,14 +546,17 @@ class BrokerMW():
                 self.logger.info(f"BrokerMW::event_loop - Received topic [{topic}] with message [{message}]")
                 
                 # Primary broker forwards to subscribers directly and replicates
-                if self.is_primary:
+                if self.is_primary and self.pub:
                     self.pub.send_string(topic_and_message)
                     self.logger.info(f"BrokerMW::event_loop - Primary forwarded message on topic [{topic}]")
                     
                     # Replicate to follower brokers
                     if hasattr(self, 'replication_socket') and self.replication_socket:
-                        self.replication_socket.send_string(topic_and_message)
-                        self.logger.debug(f"BrokerMW::event_loop - Replicated message to followers")
+                        try:
+                            self.replication_socket.send_string(topic_and_message)
+                            self.logger.debug(f"BrokerMW::event_loop - Replicated message to followers")
+                        except Exception as e:
+                            self.logger.error(f"BrokerMW::event_loop - Failed to replicate message: {str(e)}")
                 
                 # Let application know we processed something
                 if self.upcall_obj:
@@ -562,7 +570,8 @@ class BrokerMW():
                 self.logger.info(f"BrokerMW::event_loop - Follower received replicated topic [{topic}] with message [{message}]")
                 
                 # Forward replicated message to subscribers
-                self.pub.send_string(replica_message)
+                if self.pub:
+                    self.pub.send_string(replica_message)
                 
                 # Let application know we processed something
                 if self.upcall_obj:
@@ -570,6 +579,9 @@ class BrokerMW():
                 
         except Exception as e:
             self.logger.error(f"BrokerMW::event_loop - Exception: {str(e)}")
+            # Log the full traceback for debugging
+            import traceback
+            self.logger.error(f"BrokerMW::event_loop - Traceback: {traceback.format_exc()}")
     
     ########################################
     # Set Upcall Handle
@@ -696,13 +708,39 @@ class BrokerMW():
             # Only use each agent once per revival cycle
             brokers_to_revive = min(count, len(agents))
             
+            # Get current broker addresses to avoid spawning on machines that already have brokers
+            current_brokers = set()
+            if self.zk.exists(self.broker_path):
+                for broker_id in self.zk.get_children(self.broker_path):
+                    if broker_id == "leader":
+                        continue
+                    broker_path = f"{self.broker_path}/{broker_id}"
+                    if self.zk.exists(broker_path):
+                        data, _ = self.zk.get(broker_path)
+                        addr = data.decode().split(':')[0]  # Just get the IP part
+                        current_brokers.add(addr)
+            
+            # Filter agents to prefer those not already running brokers
+            preferred_agents = [a for a in agents if a['host'] not in current_brokers]
+            if not preferred_agents:
+                preferred_agents = agents  # Fall back to all agents if necessary
+            
+            # Use randomization to avoid always picking the same agents
+            random.shuffle(preferred_agents)
+            
+            # Track successfully spawned brokers
+            successful_spawns = 0
+            
             for i in range(brokers_to_revive):
                 # Check if we've been trying too long
                 if time.time() - revival_start > 90:  # 90 second safety timeout
                     self.logger.error("BrokerMW::revive_broker_replicas - Revival taking too long, aborting")
                     break
                     
-                agent = agents[i]  # Use each agent only once
+                # Use modulo to wrap around the agent list if needed
+                agent_idx = i % len(preferred_agents)
+                agent = preferred_agents[agent_idx]
+                
                 new_port = 5556 + i  # Assumes unique port assignment per broker
                 replica_name = f"broker_replica_{int(time.time())}_{i}"
                 
@@ -730,7 +768,14 @@ class BrokerMW():
                     response = socket.recv_json()
                     
                     # Process response
-                    # ... rest of your code ...
+                    if response.get('status') == 'ok':
+                        self.logger.info(f"BrokerMW::revive_broker_replicas - Successfully spawned broker {replica_name} on {agent['host']}:{new_port}")
+                        successful_spawns += 1
+                        
+                        # Wait a bit for the new broker to register
+                        time.sleep(1)
+                    else:
+                        self.logger.error(f"BrokerMW::revive_broker_replicas - Failed to spawn broker: {response}")
                     
                 except zmq.error.Again:
                     self.logger.error(f"BrokerMW::revive_broker_replicas - Timeout communicating with agent at {agent['host']}:{agent['port']}")
@@ -738,6 +783,15 @@ class BrokerMW():
                     self.logger.error(f"BrokerMW::revive_broker_replicas - Error with agent: {str(e)}")
                 finally:
                     socket.close()
+                    context.term()
+                
+                # Monitor overall progress
+                if successful_spawns >= count:
+                    self.logger.info(f"BrokerMW::revive_broker_replicas - Successfully spawned all {count} requested brokers")
+                    break
+                
+            if successful_spawns < count:
+                self.logger.warning(f"BrokerMW::revive_broker_replicas - Only spawned {successful_spawns}/{count} requested brokers")
                 
         except Exception as e:
             self.logger.error(f"BrokerMW::revive_broker_replicas - Error: {str(e)}")
