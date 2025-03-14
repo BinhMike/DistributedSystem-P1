@@ -4,6 +4,8 @@ import argparse
 import logging
 import configparser
 import threading
+import signal
+import atexit
 from kazoo.client import KazooClient  # ZooKeeper client
 from kazoo.exceptions import NodeExistsError
 from CS6381_MW.DiscoveryMW import DiscoveryMW
@@ -273,7 +275,57 @@ class DiscoveryAppln:
     def run(self):
         ''' Run Discovery Service Event Loop '''
         self.logger.info("DiscoveryAppln::run - entering event loop")
-        self.mw_obj.event_loop()
+        try:
+            # Register cleanup handlers
+            atexit.register(self.cleanup)
+            # Run the event loop
+            self.mw_obj.event_loop()
+        except KeyboardInterrupt:
+            self.logger.info("KeyboardInterrupt received, shutting down")
+        except Exception as e:
+            self.logger.error(f"Exception in event loop: {e}")
+        finally:
+            # Ensure cleanup happens
+            self.cleanup()
+
+    def cleanup(self):
+        """Clean up resources and deregister from ZooKeeper"""
+        try:
+            self.logger.info("DiscoveryAppln::cleanup - Performing cleanup operations")
+            
+            # Stop the lease renewal thread if it's running
+            self.is_primary = False
+            if self.lease_thread and self.lease_thread.is_alive():
+                self.lease_thread.join(timeout=2)
+                
+            # Explicitly delete our leader node if we're the primary
+            if self.zk and self.zk.connected and self.leader_path:
+                if self.zk.exists(self.leader_path):
+                    try:
+                        data, _ = self.zk.get(self.leader_path)
+                        our_addr = f"{args.addr}:{args.port}" if 'args' in globals() else None
+                        
+                        # Only delete if it's our node
+                        if data and our_addr and our_addr in data.decode():
+                            self.logger.info("Deleting our leader node from ZooKeeper")
+                            self.zk.delete(self.leader_path)
+                    except Exception as e:
+                        self.logger.warning(f"Error deleting leader node: {e}")
+            
+            # Close the ZooKeeper connection
+            if self.zk:
+                self.logger.info("Closing ZooKeeper connection")
+                self.zk.stop()
+                self.zk.close()
+                
+            # Close middleware resources
+            if self.mw_obj and hasattr(self.mw_obj, 'cleanup'):
+                self.mw_obj.cleanup()
+                
+            self.logger.info("Cleanup complete")
+            
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}")
 
     def dump_zk_nodes(self):
         """Debug method to dump ZooKeeper node structure"""
@@ -321,7 +373,23 @@ def main():
     logger.setLevel(args.loglevel)
     app = DiscoveryAppln(logger)
     app.configure(args)
-    app.run()
+    
+    # Register signal handlers
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}, shutting down gracefully")
+        if 'discovery' in locals() and discovery:
+            discovery.cleanup()
+        sys.exit(0)
+        
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        app.run()
+    except Exception as e:
+        logger.error(f"Exception in main: {e}")
+        if 'discovery' in locals() and discovery:
+            discovery.cleanup()
 
 if __name__ == "__main__":
     main()

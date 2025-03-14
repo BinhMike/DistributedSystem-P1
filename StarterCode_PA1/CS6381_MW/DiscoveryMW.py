@@ -87,3 +87,15 @@ class DiscoveryMW:
     def set_upcall_handle(self, upcall_obj):
         ''' Save reference to the application logic '''
         self.upcall_obj = upcall_obj
+
+    ########################################
+    # Cleanup Middleware
+    ########################################
+    def cleanup(self):
+        """Clean up middleware resources"""
+        try:
+            self.logger.info("DiscoveryMW::cleanup - Cleaning up resources")
+            if self.rep:
+                self.rep.close()
+        except Exception as e:
+            self.logger.error(f"Error during middleware cleanup: {e}")
