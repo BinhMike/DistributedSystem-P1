@@ -33,7 +33,7 @@ python3 BrokerAgent.py -a 192.168.5.166 -p 5555 -z 192.168.5.91:2181
 python3 BrokerAgent.py -a 129.114.25.181 -p 5555 -z 192.168.5.91:2181
 
 (vm6)
-python3 BrokerAgent.py -a 192.168.5.234 -p 5555 -z 192.168.5.91:2181
+python3 BrokerAppln.py -a 192.168.5.234 -p 5555 -z 192.168.5.91:2181
 
 
 (localhost)
