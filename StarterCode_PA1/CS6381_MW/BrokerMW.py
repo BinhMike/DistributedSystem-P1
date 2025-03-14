@@ -415,11 +415,17 @@ class BrokerMW():
                         broker_data, _ = self.zk.get(broker_path)
                         broker_address = broker_data.decode()
                         
+                        # Skip any empty or invalid addresses
+                        if not broker_address or ":" not in broker_address:
+                            self.logger.warning(f"BrokerMW::get_follower_brokers - Found invalid broker address: '{broker_address}' for {broker_id}")
+                            continue
+                        
                         # Avoid adding our own address to follower list
                         own_address = f"{self.addr}:{self.port}"
                         if broker_address != own_address:
                             self.follower_brokers.append(broker_address)
                 
+                # Log only valid follower brokers
                 self.logger.info(f"BrokerMW::get_follower_brokers - Found {len(self.follower_brokers)} followers: {self.follower_brokers}")
         except Exception as e:
             self.logger.error(f"BrokerMW::get_follower_brokers - Error: {str(e)}")
@@ -637,56 +643,84 @@ class BrokerMW():
     ########################################
     def start_quorum_monitoring(self):
         """Start monitoring the broker quorum to maintain 3 replicas"""
-        def quorum_monitoring_task():
-            self.logger.info("BrokerMW::quorum_monitoring_task - Starting quorum monitoring")
-            
-            while self.is_primary:
-                try:
-                    # Get current broker count
-                    broker_count = 0
-                    if self.zk.exists(self.broker_path):
-                        brokers = self.zk.get_children(self.broker_path)
-                        # Filter out the "leader" node which isn't a broker instance
-                        broker_count = len([b for b in brokers if b != "leader"])
-                    
-                    self.logger.info(f"BrokerMW::quorum_monitoring_task - Current broker count: {broker_count}")
-                    
-                    # Check if we need to revive brokers
-                    if broker_count < self.quorum_size and not self.reviving:
-                        self.logger.warning(f"BrokerMW::quorum_monitoring_task - Broker count below quorum ({broker_count}/{self.quorum_size})")
-                        
-                        # Number of brokers to revive
-                        to_revive = self.quorum_size - broker_count
-                        
-                        # Lock operations during revival
-                        self.reviving = True
-                        
-                        # Create a flag in ZooKeeper to indicate revival in progress
-                        self.zk.ensure_path(self.quorum_path)
-                        revival_flag_path = f"{self.quorum_path}/revival_in_progress"
-                        if not self.zk.exists(revival_flag_path):
-                            self.zk.create(revival_flag_path, b"true", ephemeral=True)
-                        
-                        # Start revival in a separate thread to avoid blocking monitor
-                        revival_thread = threading.Thread(
-                            target=self.revive_broker_replicas, 
-                            args=(to_revive, revival_flag_path),
-                            daemon=True
-                        )
-                        revival_thread.start()
-                    
-                except Exception as e:
-                    self.logger.error(f"BrokerMW::quorum_monitoring_task - Error: {str(e)}")
-                
-                # Sleep before next check
-                time.sleep(self.quorum_check_interval)
-            
-            self.logger.info("BrokerMW::quorum_monitoring_task - Quorum monitoring stopped")
-        
         # Start the monitoring thread
-        self.quorum_thread = threading.Thread(target=quorum_monitoring_task, daemon=True)
+        self.quorum_thread = threading.Thread(target=self.quorum_monitoring_task, daemon=True)
         self.quorum_thread.start()
         self.logger.info("BrokerMW::start_quorum_monitoring - Quorum monitoring thread started")
+
+    ########################################
+    # Quorum Monitoring Task
+    ########################################
+    def quorum_monitoring_task(self):
+        self.logger.info("BrokerMW::quorum_monitoring_task - Starting quorum monitoring")
+        
+        while self.is_primary:
+            try:
+                # Get current broker count
+                valid_brokers = []
+                if self.zk.exists(self.broker_path):
+                    brokers = self.zk.get_children(self.broker_path)
+                    # Filter out the "leader" node which isn't a broker instance
+                    for broker_id in brokers:
+                        if broker_id == "leader":
+                            continue
+                        
+                        broker_path = f"{self.broker_path}/{broker_id}"
+                        if self.zk.exists(broker_path):
+                            broker_data, _ = self.zk.get(broker_path)
+                            broker_address = broker_data.decode()
+                            
+                            # Skip any empty or invalid addresses
+                            if not broker_address or ":" not in broker_address:
+                                self.logger.warning(f"BrokerMW::quorum_monitoring_task - Found invalid broker address: '{broker_address}' for {broker_id}")
+                                
+                                # Clean up invalid node
+                                try:
+                                    self.zk.delete(broker_path)
+                                    self.logger.info(f"BrokerMW::quorum_monitoring_task - Cleaned up invalid broker node: {broker_path}")
+                                except Exception as e:
+                                    self.logger.error(f"BrokerMW::quorum_monitoring_task - Failed to clean up invalid node: {str(e)}")
+                                
+                                continue
+                            
+                            valid_brokers.append(broker_address)
+                
+                broker_count = len(valid_brokers)
+                self.logger.info(f"BrokerMW::quorum_monitoring_task - Current broker count: {broker_count}")
+                
+                # Check if we need to revive brokers
+                if broker_count < self.quorum_size and not self.reviving:
+                    self.logger.warning(f"BrokerMW::quorum_monitoring_task - Broker count below quorum ({broker_count}/{self.quorum_size})")
+                    
+                    # Number of brokers to revive
+                    to_revive = self.quorum_size - broker_count
+                    
+                    # Lock operations during revival
+                    self.reviving = True
+                    
+                    # Create a flag in ZooKeeper to indicate revival in progress
+                    self.zk.ensure_path(self.quorum_path)
+                    revival_flag_path = f"{self.quorum_path}/revival_in_progress"
+                    if not self.zk.exists(revival_flag_path):
+                        self.zk.create(revival_flag_path, b"true", ephemeral=True)
+                    
+                    # Start revival in a separate thread to avoid blocking monitor
+                    revival_thread = threading.Thread(
+                        target=self.revive_broker_replicas, 
+                        args=(to_revive, revival_flag_path),
+                        daemon=True
+                    )
+                    revival_thread.start()
+                
+            except Exception as e:
+                self.logger.error(f"BrokerMW::quorum_monitoring_task - Error: {str(e)}")
+                import traceback
+                self.logger.error(f"BrokerMW::quorum_monitoring_task - Traceback: {traceback.format_exc()}")
+            
+            # Sleep before next check
+            time.sleep(self.quorum_check_interval)
+        
+        self.logger.info("BrokerMW::quorum_monitoring_task - Quorum monitoring stopped")
 
     ########################################
     # Revive Broker Replicas
