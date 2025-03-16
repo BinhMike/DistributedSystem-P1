@@ -33,7 +33,7 @@ python3 BrokerAppln.py -n broker1 -a 192.168.5.166 -p 5554 -z 192.168.5.91:2181
 python3 BrokerAppln.py --agent -a 192.168.5.166 -p 5555 -z 192.168.5.91:2181
 
 (vm5)
-python3 BrokerAppln.py --agent -a 129.114.25.181 -p 5555 -z 192.168.5.91:2181
+python3 BrokerAppln.py --agent -a 192.168.5.226 -p 5555 -z 192.168.5.91:2181
 
 (vm6)
 python3 BrokerAppln.py --agent -a 192.168.5.234 -p 5555 -z 192.168.5.91:2181
@@ -48,6 +48,7 @@ python3 BrokerAppln.py -n broker3 -p 6002 --addr localhost -z localhost:2181
 
 
 Run the subscriber：
+(vm7)
 python3 SubscriberAppln.py -n sub1 -z localhost:2181 -T 9 -l 20
 
 python3 SubscriberAppln.py -n sub2 -z localhost:2181 -T 9 -l 20
