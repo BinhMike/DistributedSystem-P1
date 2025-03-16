@@ -4,10 +4,22 @@ import argparse
 import logging
 import configparser
 import threading
+import subprocess
+import socket
+from kazoo.recipe.lock import Lock
 from kazoo.client import KazooClient  # ZooKeeper client
 from kazoo.exceptions import NodeExistsError
 from CS6381_MW.DiscoveryMW import DiscoveryMW
 from CS6381_MW import discovery_pb2
+
+# Helper function for getting new port for quorum spawning
+def get_free_port():
+    """Bind a temporary socket to port 0 and return the OS-assigned free port."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('', 0))  # Let OS choose a free port
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 ##################################
 #       Discovery Application Class
@@ -15,24 +27,100 @@ from CS6381_MW import discovery_pb2
 class DiscoveryAppln:
     def __init__(self, logger):
         self.logger = logger
-        self.mw_obj = None        # Middleware handle
-        self.zk = None            # ZooKeeper client
+        self.mw_obj = None          # Middleware handle
+        self.zk = None              # ZooKeeper client
         self.registry = {"publishers": {}, "subscribers": {}, "brokers": {}}
-        self.is_primary = False   # True if this instance becomes leader
+        self.is_primary = False     # True if this instance becomes leader
         self.leader_path = "/discovery/leader"
+        # Replica-related path for quorum
+        self.replicas_path = "/discovery/replicas"
         # Lease settings (in seconds)
-        self.lease_duration = 10          # How long each lease is valid
+        self.lease_duration = 30          # How long each lease is valid
         self.lease_renew_interval = 10    # How frequently to renew the lease
-        self.max_leader_duration = 30    # Maximum time this instance can remain primary
+        self.max_leader_duration = 120    # Maximum time this instance can remain primary
         self.leader_start_time = None     # Time when this instance became leader
         self.lease_thread = None          # Thread for lease renewal
+        self.args = None                # Will store command-line args
+        self.bootstrap_complete = False # Flag to indicate bootstrapping is complete
+
+    ########################################
+    # Quorum Check Helper
+    ########################################
+    def quorum_met(self):
+        """Return True if at least 3 Discovery replicas are registered."""
+        try:
+            replicas = self.zk.get_children(self.replicas_path)
+            self.logger.info(f"Quorum check: {len(replicas)} replicas present.")
+            return len(replicas) >= 3
+        except Exception as e:
+            self.logger.error(f"Error checking quorum: {str(e)}")
+            return False
+
+    ########################################
+    # Spawn a New Replica
+    ########################################
+    def spawn_replica(self):
+        """Attempt to spawn a new Discovery replica using a global lock to ensure only one spawns."""
+        self.logger.info("Attempting to spawn a new Discovery replica to restore quorum.")
+        
+        # Use a global lock in ZooKeeper to coordinate spawns.
+        spawn_lock = Lock(self.zk, "/discovery/spawn_lock")
+        try:
+            # Acquire the lock with a timeout (say, 5 seconds)
+            if spawn_lock.acquire(timeout=5):
+                # Once the lock is acquired, re-check the replica count.
+                replicas = self.zk.get_children(self.replicas_path)
+                if len(replicas) >= 3:
+                    self.logger.info("Quorum restored while waiting for lock; no need to spawn.")
+                    spawn_lock.release()
+                    return
+                
+                free_port = get_free_port()
+                self.logger.info("Spawn lock acquired; proceeding to spawn new replica.")
+                # Construct the command using stored args
+                cmd = [
+                    "gnome-terminal",
+                    "--", "bash", "-c",
+                    f"python3 {sys.argv[0]} -p {free_port} -a {self.args.addr} -z {self.args.zookeeper} -c {self.args.config} -l {self.args.loglevel}; exec bash"
+                ]
+                try:
+                    subprocess.Popen(cmd)
+                    self.logger.info(f"Spawned new Discovery replica with command: {' '.join(cmd)}")
+                except Exception as e:
+                    self.logger.error(f"Failed to spawn a new replica: {str(e)}")
+                finally:
+                    spawn_lock.release()
+            else:
+                self.logger.info("Could not acquire spawn lock; another replica may be spawning.")
+        except Exception as e:
+            self.logger.error(f"Error acquiring spawn lock: {str(e)}")
+
+
+    ########################################
+    # Wait for Bootstrap Completion
+    ########################################
+    def wait_for_bootstrap(self):
+        """Wait until at least 3 replica nodes are registered, then mark bootstrap as complete."""
+        self.logger.info("Waiting for bootstrap: expecting at least 3 replicas before enabling auto-spawn...")
+        while True:
+            try:
+                replicas = self.zk.get_children(self.replicas_path)
+                self.logger.info(f"Bootstrap check: {len(replicas)} replicas present.")
+                if len(replicas) >= 3:
+                    self.logger.info("Bootstrap complete: quorum achieved.")
+                    break
+            except Exception as e:
+                self.logger.error(f"Error during bootstrap wait: {str(e)}")
+            time.sleep(2)
+        self.bootstrap_complete = True
 
     ########################################
     # Configure Discovery Application
     ########################################
     def configure(self, args):
-        """ Configure the Discovery Application with warm-passive replication and lease support """
+        """ Configure the Discovery Application with warm-passive replication, lease, and quorum support """
         try:
+            self.args = args  # Save args for future use (e.g., spawning replicas)
             self.logger.info("DiscoveryAppln::configure")
             config_obj = configparser.ConfigParser()
             config_obj.read(args.config)
@@ -40,26 +128,41 @@ class DiscoveryAppln:
             self.dissemination_strategy = config_obj.get("Dissemination", "Strategy", fallback="Direct")
             self.logger.info(f"Dissemination strategy set to: {self.dissemination_strategy}")
 
-            # Optionally read lease settings from config - currently go with default values
-            # if config_obj.has_option("Discovery", "lease_duration"):
-            #     self.lease_duration = config_obj.getint("Discovery", "lease_duration")
-            # if config_obj.has_option("Discovery", "lease_renew_interval"):
-            #     self.lease_renew_interval = config_obj.getint("Discovery", "lease_renew_interval")
-            # if config_obj.has_option("Discovery", "max_leader_duration"):
-            #     self.max_leader_duration = config_obj.getint("Discovery", "max_leader_duration")
-
             # Connect to ZooKeeper
             self.logger.info(f"Connecting to ZooKeeper at {args.zookeeper}")
             self.zk = KazooClient(hosts=args.zookeeper)
             self.zk.start(timeout=10)
 
-            # Ensure the base path for discovery exists
+            # Ensure base paths exist
             self.logger.info("Ensuring /discovery path exists")
             self.zk.ensure_path("/discovery")
+            self.logger.info(f"Ensuring {self.replicas_path} path exists")
+            self.zk.ensure_path(self.replicas_path)
+
+            # Register this instance as a replica
+            discovery_address = f"{args.addr}:{args.port}"
+            replica_node = f"{self.replicas_path}/{discovery_address}"
+            try:
+                self.zk.create(replica_node, discovery_address.encode(), ephemeral=True)
+                self.logger.info(f"Registered replica node: {replica_node}")
+            except NodeExistsError:
+                self.zk.delete(replica_node)
+                self.zk.create(replica_node, discovery_address.encode(), ephemeral=True)
+                self.logger.info(f"Updated replica node: {replica_node}")
+
+            # Do not spawn new replicas until bootstrapping is complete.
+            @self.zk.ChildrenWatch(self.replicas_path)
+            def watch_replicas(children):
+                num = len(children)
+                self.logger.info(f"Replica watch: {num} replicas present.")
+                if self.bootstrap_complete and num < 3:
+                    self.logger.warning("Quorum not met: fewer than 3 replicas active.")
+                    self.spawn_replica()
+
+            # Wait for bootstrap: ensure that at least 3 replicas are active before proceeding.
+            self.wait_for_bootstrap()
 
             # Attempt to become the leader by creating the ephemeral leader node.
-            discovery_address = f"{args.addr}:{args.port}"
-            # Prepare leader data: address and lease expiry timestamp
             lease_expiry = time.time() + self.lease_duration
             leader_data = f"{discovery_address}|{lease_expiry}"
             try:
@@ -71,18 +174,13 @@ class DiscoveryAppln:
             except NodeExistsError:
                 self.is_primary = False
                 self.logger.info("A leader already exists. Running as backup.")
-                # Watch for leader znode deletion so backup can try to become primary.
                 @self.zk.DataWatch(self.leader_path)
                 def watch_leader(data, stat, event):
                     if event is not None and event.type == "DELETED":
                         self.logger.info("Leader znode deleted. Attempting to become primary...")
-                        # Add a small delay to avoid race conditions
                         time.sleep(1)
                         try:
-                            # Re-ensure the discovery path exists
                             self.zk.ensure_path("/discovery")
-                            
-                            # Check if the leader node still doesn't exist
                             if not self.zk.exists(self.leader_path):
                                 new_expiry = time.time() + self.lease_duration
                                 new_data = f"{discovery_address}|{new_expiry}"
@@ -132,11 +230,9 @@ class DiscoveryAppln:
 
         def renew_lease():
             while self.is_primary:
-                # Check if maximum leader duration has been reached.
                 if time.time() - self.leader_start_time >= self.max_leader_duration:
                     self.logger.info("Max leader duration reached. Relinquishing primary role.")
                     try:
-                        # Only delete the leader node, not the entire path
                         if self.zk.exists(self.leader_path):
                             self.zk.delete(self.leader_path)
                             self.logger.info("Deleted leader znode to relinquish leadership.")
@@ -156,7 +252,7 @@ class DiscoveryAppln:
                     self.logger.error(f"Failed to renew lease: {str(e)}")
                     break
 
-        import threading  # Ensure threading is imported
+        import threading
         self.lease_thread = threading.Thread(target=renew_lease, daemon=True)
         self.lease_thread.start()
 
@@ -164,7 +260,15 @@ class DiscoveryAppln:
     # Handle Registration Request
     ########################################
     def register(self, register_req):
-        ''' Handle publisher/subscriber registration '''
+        """ Handle publisher/subscriber registration """
+        if not self.quorum_met():
+            self.logger.warning("Quorum not met. Rejecting registration.")
+            response = discovery_pb2.DiscoveryResp()
+            response.msg_type = discovery_pb2.TYPE_REGISTER
+            response.register_resp.status = discovery_pb2.STATUS_CHECK_AGAIN
+            response.register_resp.reason = "Quorum not met; please wait until all replicas are active."
+            return response
+
         role_map = {
             discovery_pb2.ROLE_PUBLISHER: "Publisher",
             discovery_pb2.ROLE_SUBSCRIBER: "Subscriber",
@@ -174,7 +278,6 @@ class DiscoveryAppln:
         entity_id = register_req.info.id
         self.logger.info(f"Registering {role}: {entity_id}")
 
-        # If not primary, then respond with not-primary status.
         if not self.is_primary:
             self.logger.warning("Not primary; cannot process registration. Inform client to contact the leader.")
             response = discovery_pb2.DiscoveryResp()
@@ -182,7 +285,6 @@ class DiscoveryAppln:
             response.register_resp.status = discovery_pb2.STATUS_NOT_PRIMARY
             return response
 
-        # Otherwise, proceed to register the entity in ZooKeeper.
         category = role.lower() + "s"
         entity_path = f"/{category}/{entity_id}"
         entity_data = f"{register_req.info.addr}:{register_req.info.port}"
@@ -216,8 +318,15 @@ class DiscoveryAppln:
     # Handle Lookup Request
     ########################################
     def lookup(self, lookup_req):
-        ''' Handle subscriber lookup request '''
+        """ Handle subscriber lookup request """
         self.logger.info(f"Lookup request for topics: {lookup_req.topiclist}")
+
+        if not self.quorum_met():
+            self.logger.warning("Quorum not met. Rejecting lookup request.")
+            response = discovery_pb2.DiscoveryResp()
+            response.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
+            response.lookup_resp.reason = "Quorum not met; please wait until all replicas are active."
+            return response
 
         if not self.is_primary:
             self.logger.warning("Not primary; lookup request cannot be processed here.")
@@ -239,16 +348,12 @@ class DiscoveryAppln:
                 nodes = self.zk.get_children(path)
                 self.logger.info(f"Found {len(nodes)} nodes in ZooKeeper under {path}")
                 for node_id in nodes:
-                    # Skip any node named "leader" - it's not a publisher/subscriber/broker
                     if node_id == "leader":
                         self.logger.warning(f"Skipping 'leader' node found in {path}")
                         continue
-                        
                     try:
                         data, _ = self.zk.get(f"{path}/{node_id}")
                         node_data = data.decode()
-                        
-                        # Extra validation to ensure proper format
                         if ":" in node_data:
                             addr, port = node_data.split(":")
                             node_info = discovery_pb2.RegistrantInfo(id=node_id, addr=addr, port=int(port))
@@ -271,12 +376,12 @@ class DiscoveryAppln:
     # Run the Discovery Service
     ########################################
     def run(self):
-        ''' Run Discovery Service Event Loop '''
+        """ Run Discovery Service Event Loop """
         self.logger.info("DiscoveryAppln::run - entering event loop")
         self.mw_obj.event_loop()
 
     def dump_zk_nodes(self):
-        """Debug method to dump ZooKeeper node structure"""
+        """ Debug method to dump ZooKeeper node structure """
         self.logger.info("Current ZooKeeper nodes:")
 
         def print_tree(path, level=0):
@@ -295,7 +400,7 @@ class DiscoveryAppln:
                 self.logger.info(f"{'  ' * level}|- {child} {f'({data})' if data else ''}")
                 print_tree(child_path, level + 1)
         print_tree("/")
-
+        
 
 ###################################
 # Parse command line arguments
