@@ -3,115 +3,72 @@
 # Author: Aniruddha Gokhale
 # Vanderbilt University
 #
-# Purpose: Skeleton/Starter code for the broker middleware code
+# Purpose: Broker Middleware with warm-passive replication
 #
 # Created: Spring 2023
 #
 ###############################################
 
-# Designing the logic is left as an exercise for the student. Please see the
-# PublisherMW.py file as to how the middleware side of things are constructed
-# and accordingly design things for the broker side of things.
-#
-# As mentioned earlier, a broker serves as a proxy and hence has both
-# publisher and subscriber roles. So in addition to the REQ socket to talk to the
-# Discovery service, it will have both PUB and SUB sockets as it must work on
-# behalf of the real publishers and subscribers. So this will have the logic of
-# both publisher and subscriber middleware.
-
-
 import zmq
 import logging
 import time
 import threading
-import subprocess
-import os
-from kazoo import exceptions
-from kazoo.exceptions import NodeExistsError
-from CS6381_MW import discovery_pb2  
-import random
+from CS6381_MW import discovery_pb2
 
-class BrokerMW():
-    ########################################
-    # Constructor
-    ########################################
-    def __init__(self, logger, zk_client, is_leader=False):
+class BrokerMW:
+    def __init__(self, logger):
         self.logger = logger
-        self.zk = zk_client
         self.context = zmq.Context()
         self.sub = None          # SUB socket to receive from publishers
         self.pub = None          # PUB socket to send to subscribers
         self.req = None          # REQ socket for Discovery communications
-        self.poller = None
-        self.upcall_obj = None   # Application logic handle
-        self.addr = None
-        self.port = None
+        self.poller = None       # ZMQ poller for event handling
+        self.upcall_obj = None   # Application object for callbacks
+        self.addr = None         # Our IP address
+        self.port = None         # Our port
+        self.zk = None           # ZooKeeper client (shared with app)
+        self.is_primary = False  # Whether this instance is the primary
         
-        # ZK paths
-        self.broker_path = "/brokers"
-        self.leader_path = "/brokers/leader"
-        self.publisher_path = "/publishers"
-        self.quorum_path = "/brokers/quorum"  # New path for quorum management
-        
-        # Leadership and replication
-        self.is_primary = is_leader  # Initialize with provided value
-        self.primary_start_time = None
-        self.follower_brokers = []
-        
-        # Lease settings (in seconds)
-        self.lease_duration = 10
-        self.lease_renew_interval = 5
-        self.max_leader_duration = 30
-        self.lease_thread = None
-        
-        # Quorum management
-        self.quorum_size = 3  # Target number of replicas
-        self.quorum_check_interval = 5  # Seconds between quorum checks
-        self.quorum_thread = None
-        self.reviving = False  # Flag to indicate if we're currently reviving a replica
-
-    ########################################
-    # Configure Middleware
-    ########################################
-    def configure(self, args):
+        # Replication sockets
+        self.repl_pub = None     # PUB socket for sending replication data (primary)
+        self.repl_sub = None     # SUB socket for receiving replication data (backup)
+    
+    def configure(self, args, is_primary, zk_client):
+        """Initialize the Broker Middleware"""
         try:
             self.logger.info("BrokerMW::configure")
-            self.args = args
-            self.addr = args.addr  
-            self.port = args.port
             
-            # Initialize ZMQ sockets
+            # Save arguments
+            self.addr = args.addr
+            self.port = args.port
+            self.is_primary = is_primary
+            self.zk = zk_client
+            
+            # Initialize ZMQ poller
             self.poller = zmq.Poller()
             
-            # Set up SUB socket to receive from publishers
+            # Create PUB socket for subscribers
+            self.pub = self.context.socket(zmq.PUB)
+            self.pub.bind(f"tcp://*:{args.port}")
+            self.logger.info(f"BrokerMW::configure - PUB socket bound to port {args.port}")
+            
+            # Create SUB socket for receiving from publishers
             self.sub = self.context.socket(zmq.SUB)
             self.sub.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all topics
             self.poller.register(self.sub, zmq.POLLIN)
-            self.logger.info("BrokerMW::configure - subscribed to all topics")
+            self.logger.info("BrokerMW::configure - SUB socket created")
             
-            # Set up PUB socket for subscribers
-            self.pub = self.context.socket(zmq.PUB)
-            self.pub.bind(f"tcp://*:{args.port}")
-            self.logger.info(f"BrokerMW::configure - PUB socket bound to tcp://*:{args.port}")
-            
-            # Ensure ZooKeeper paths exist
-            self.ensure_zk_paths()
-            
-            # Register broker in ZooKeeper
-            self.register_with_zk()
-            
-            # Set up leadership election
-            self.setup_leadership()
-            
-            # Subscribe to current Publishers
-            self.subscribe_to_publishers()
-            
-            # Watch for publisher changes
-            self.zk.ChildrenWatch(self.publisher_path, self.handle_publisher_change)
-            
-            # Start quorum monitoring (only for primary)
+            # Set up replication based on role
             if self.is_primary:
-                self.start_quorum_monitoring()
+                self.setup_primary_replication()
+            else:
+                self.setup_backup_replication()
+            
+            # Connect to all existing publishers
+            self.connect_to_publishers()
+            
+            # Set up publisher watcher
+            self.zk.ChildrenWatch("/publishers", self.handle_publisher_change)
             
             self.logger.info("BrokerMW::configure - Configuration complete")
             
@@ -119,465 +76,150 @@ class BrokerMW():
             self.logger.error(f"BrokerMW::configure - Exception: {str(e)}")
             raise e
     
-    ########################################
-    # Ensure ZooKeeper paths exist
-    ########################################
-    def ensure_zk_paths(self):
-        """Ensure all required ZooKeeper paths exist"""
+    def setup_primary_replication(self):
+        """Set up replication as primary"""
         try:
-            self.logger.info("BrokerMW::ensure_zk_paths - Creating ZK paths if needed")
-            self.zk.ensure_path(self.broker_path)
-            self.zk.ensure_path(self.publisher_path)
+            # Create a PUB socket for replicating messages to backups
+            self.repl_port = self.port + 1000  # Use port+1000 for replication
+            self.repl_pub = self.context.socket(zmq.PUB)
+            self.repl_pub.bind(f"tcp://*:{self.repl_port}")
+            self.logger.info(f"BrokerMW::setup_primary_replication - Replication PUB socket bound to port {self.repl_port}")
+            
+            # Clean up any backup subscription if it exists
+            if hasattr(self, 'repl_sub') and self.repl_sub:
+                self.poller.unregister(self.repl_sub)
+                self.repl_sub.close()
+                self.repl_sub = None
+            
         except Exception as e:
-            self.logger.error(f"BrokerMW::ensure_zk_paths - Error: {str(e)}")
+            self.logger.error(f"BrokerMW::setup_primary_replication - Exception: {str(e)}")
             raise e
     
-    ########################################
-    # Register with ZooKeeper
-    ########################################
-    def register_with_zk(self):
-        """Register this broker with ZooKeeper"""
+    def setup_backup_replication(self):
+        """Set up replication as backup"""
         try:
-            broker_address = f"{self.addr}:{self.port}"
-            broker_node_path = f"{self.broker_path}/{self.args.name}"
-            
-            # Clean up old node if it exists
-            if self.zk.exists(broker_node_path):
-                self.zk.delete(broker_node_path)
-            
-            # Create new ephemeral node
-            self.zk.create(broker_node_path, broker_address.encode(), ephemeral=True)
-            self.logger.info(f"BrokerMW::register_with_zk - Registered in ZooKeeper at {broker_node_path}")
-        except Exception as e:
-            self.logger.error(f"BrokerMW::register_with_zk - Error: {str(e)}")
-            raise e
-
-    ########################################
-    # Setup Leadership Election
-    ########################################
-    def setup_leadership(self):
-        """Set up leadership election mechanism"""
-        try:
-            self.logger.info("BrokerMW::setup_leadership - Setting up leadership mechanism")
-            
-            # Try to become the leader
-            broker_address = f"{self.addr}:{self.port}"
-            
-            # Prepare leader data: address and lease expiry timestamp
-            lease_expiry = time.time() + self.lease_duration
-            leader_data = f"{broker_address}|{lease_expiry}"
-            
-            try:
-                # Make sure the parent path exists
-                self.zk.ensure_path(self.broker_path)
+            # Clean up any primary publication socket if it exists
+            if hasattr(self, 'repl_pub') and self.repl_pub:
+                self.repl_pub.close()
+                self.repl_pub = None
                 
-                # Try to create the leader node (ephemeral)
-                self.zk.create(self.leader_path, leader_data.encode(), ephemeral=True)
-                self.is_primary = True
-                self.primary_start_time = time.time()
-                self.logger.info(f"BrokerMW::setup_leadership - Became primary with lease expiring at {lease_expiry}")
+            # Get leader address
+            leader_data = None
+            if self.zk.exists("/broker/leader"):
+                data, _ = self.zk.get("/broker/leader")
+                leader_data = data.decode()
                 
-                # Start lease renewal
-                self.start_lease_renewal(broker_address)
-                
-                # Set up replication as leader
-                self.setup_leader_replication()
-                
-            except NodeExistsError:
-                self.is_primary = False
-                self.logger.info("BrokerMW::setup_leadership - A leader already exists, running as backup")
-                
-                # Watch the leader node for changes and deletions
-                self.watch_leader_node(broker_address)
-                
-                # Setup follower replication
-                self.setup_follower_replication()
-            
-            # Log current leader information
-            if self.zk.exists(self.leader_path):
-                data, _ = self.zk.get(self.leader_path)
-                self.logger.info(f"BrokerMW::setup_leadership - Current leader in ZooKeeper: {data.decode()}")
+            if leader_data and '|' in leader_data:
+                leader_addr = leader_data.split('|')[0]  # Extract address from leader data
+                if ':' in leader_addr:
+                    addr, port = leader_addr.split(':')
+                    repl_port = int(port) + 1000  # Primary's replication port
+                    
+                    # Create SUB socket to receive replicated messages
+                    if hasattr(self, 'repl_sub') and self.repl_sub:
+                        self.poller.unregister(self.repl_sub)
+                        self.repl_sub.close()
+                        
+                    self.repl_sub = self.context.socket(zmq.SUB)
+                    self.repl_sub.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all topics
+                    self.repl_sub.connect(f"tcp://{addr}:{repl_port}")
+                    self.poller.register(self.repl_sub, zmq.POLLIN)
+                    self.logger.info(f"BrokerMW::setup_backup_replication - Connected to primary's replication at {addr}:{repl_port}")
+                    
             else:
-                self.logger.error("BrokerMW::setup_leadership - Leader node does not exist after setup")
+                self.logger.warning("BrokerMW::setup_backup_replication - No leader found or invalid leader data")
                 
         except Exception as e:
-            self.logger.error(f"BrokerMW::setup_leadership - Error: {str(e)}")
-            raise e
+            self.logger.error(f"BrokerMW::setup_backup_replication - Exception: {str(e)}")
     
-    ########################################
-    # Watch Leader Node
-    ########################################
-    def watch_leader_node(self, broker_address):
-        """Watch the leader node for changes or deletion"""
-        @self.zk.DataWatch(self.leader_path)
-        def watch_leader(data, stat, event):
-            if event is not None and event.type == "DELETED":
-                self.logger.info("BrokerMW::watch_leader_node - Leader node deleted, attempting to become primary...")
-                # Add delay to avoid race conditions
-                time.sleep(1)
-                
-                try:
-                    # Re-ensure the broker path exists
-                    self.zk.ensure_path(self.broker_path)
-                    
-                    # Check if leader node still doesn't exist
-                    if not self.zk.exists(self.leader_path):
-                        new_expiry = time.time() + self.lease_duration
-                        new_data = f"{broker_address}|{new_expiry}"
-                        self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
-                        self.is_primary = True
-                        self.primary_start_time = time.time()
-                        
-                        self.logger.info(f"BrokerMW::watch_leader_node - This instance has now become the primary with lease expiring at {new_expiry}")
-                        
-                        # Start lease renewal and leader replication
-                        self.start_lease_renewal(broker_address)
-                        self.setup_leader_replication()
-                        
-                        # Start quorum monitoring (now that we're primary)
-                        self.start_quorum_monitoring()
-                    else:
-                        self.logger.info("BrokerMW::watch_leader_node - Leader node already recreated by another instance")
-                        self.is_primary = False
-                except NodeExistsError:
-                    self.logger.info("BrokerMW::watch_leader_node - Another instance became primary while we were trying")
-                    self.is_primary = False
-                except Exception as e:
-                    self.logger.error(f"BrokerMW::watch_leader_node - Error during leadership transition: {str(e)}")
-                    self.is_primary = False
-
-    ########################################
-    # Start Lease Renewal Thread
-    ########################################
-    def start_lease_renewal(self, broker_address):
-        """Start a background thread for lease renewal"""
-        def renewal_task():
-            while self.is_primary:
-                try:
-                    # Check if we've been primary too long
-                    current_time = time.time()
-                    if self.primary_start_time and (current_time - self.primary_start_time) > self.max_leader_duration:
-                        self.logger.info("BrokerMW::lease_renewal - Max leader duration reached, stepping down")
-                        # Delete our own leader node to trigger re-election
-                        if self.zk.exists(self.leader_path):
-                            self.zk.delete(self.leader_path)
-                        self.is_primary = False
-                        break
-                    
-                    # Renew the lease
-                    if self.zk.exists(self.leader_path):
-                        new_expiry = time.time() + self.lease_duration
-                        new_data = f"{broker_address}|{new_expiry}"
-                        self.zk.set(self.leader_path, new_data.encode())
-                        self.logger.debug(f"BrokerMW::lease_renewal - Lease renewed, new expiry: {new_expiry}")
-                    else:
-                        self.logger.warning("BrokerMW::lease_renewal - Leader node doesn't exist, attempting to reacquire leadership...")
-                        # Add a small delay to reduce race conditions
-                        time.sleep(1)
-                        try:
-                            new_expiry = time.time() + self.lease_duration
-                            new_data = f"{broker_address}|{new_expiry}"
-                            self.zk.ensure_path(self.broker_path)
-                            self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
-                            self.is_primary = True
-                            self.primary_start_time = time.time()
-                            self.logger.info("BrokerMW::lease_renewal - Successfully re-elected as primary")
-                        except NodeExistsError:
-                            self.logger.warning("BrokerMW::lease_renewal - Another instance became primary; will retry shortly")
-                            time.sleep(1)
-                            continue
-                        except Exception as e:
-                            self.logger.error(f"BrokerMW::lease_renewal - Failed to recreate leader node: {str(e)}")
-                            self.is_primary = False
-                            break
-                
-                except Exception as e:
-                    self.logger.error(f"BrokerMW::lease_renewal - Error: {str(e)}")
-                    self.is_primary = False
-                    break
-                
-                # Sleep before next renewal
-                time.sleep(self.lease_renew_interval)
-            
-            self.logger.info("BrokerMW::lease_renewal - Lease renewal thread exiting")
-            
-            # Clean up replication resources if we're no longer primary
-            if hasattr(self, 'replication_socket') and self.replication_socket:
-                try:
-                    self.replication_socket.close()
-                    delattr(self, 'replication_socket')
-                except Exception as e:
-                    self.logger.error(f"BrokerMW::lease_renewal - Error closing replication socket: {str(e)}")
-            
-            # Setup as follower instead
-            try:
-                self.setup_follower_replication()
-            except Exception as e:
-                self.logger.error(f"BrokerMW::lease_renewal - Error setting up as follower: {str(e)}")
-        
-        # Start the renewal thread
-        self.lease_thread = threading.Thread(target=renewal_task, daemon=True)
-        self.lease_thread.start()
-        self.logger.info("BrokerMW::start_lease_renewal - Lease renewal thread started")
-    
-    ########################################
-    # Setup Leader Replication
-    ########################################
-    def setup_leader_replication(self):
-        """Configure replication as a leader broker"""
+    def connect_to_publishers(self):
+        """Connect to all registered publishers"""
         try:
-            # Clean up any existing replication listener if we're transitioning from follower to leader
-            if hasattr(self, 'replication_listener') and self.replication_listener:
-                try:
-                    self.poller.unregister(self.replication_listener)
-                    self.replication_listener.close()
-                    delattr(self, 'replication_listener')
-                except Exception as e:
-                    self.logger.error(f"BrokerMW::setup_leader_replication - Error cleaning up listener: {str(e)}")
+            self.logger.info("BrokerMW::connect_to_publishers - Connecting to publishers")
             
-            # Create replication PUB socket for followers
-            self.replication_socket = self.context.socket(zmq.PUB)
-            self.replication_socket.bind("tcp://*:7000")
-            self.logger.info("BrokerMW::setup_leader_replication - Replication socket started on port 7000")
-            
-            # Start thread to periodically update follower list
-            self.get_follower_brokers()
-            
-            # Wait a brief moment for the socket to be fully established
-            time.sleep(0.1)
-            
-            # Start the follower sync thread only after replication socket is established
-            self.sync_followers_task = threading.Thread(target=self.periodic_follower_sync, daemon=True)
-            self.sync_followers_task.start()
-            
-        except Exception as e:
-            self.logger.error(f"BrokerMW::setup_leader_replication - Error: {str(e)}")
-
-    ########################################
-    # Setup Follower Replication
-    ########################################
-    def setup_follower_replication(self):
-        """Configure replication as a follower broker"""
-        try:
-            # Clean up any existing replication socket if we're transitioning from leader to follower
-            if hasattr(self, 'replication_socket') and self.replication_socket:
-                try:
-                    self.replication_socket.close()
-                    delattr(self, 'replication_socket')
-                except Exception as e:
-                    self.logger.error(f"BrokerMW::setup_follower_replication - Error cleaning up socket: {str(e)}")
-            
-            # Get current leader address
-            if self.zk.exists(self.leader_path):
-                leader_data, _ = self.zk.get(self.leader_path)
-                leader_data_str = leader_data.decode()
+            if self.zk.exists("/publishers"):
+                publishers = self.zk.get_children("/publishers")
+                self.logger.info(f"BrokerMW::connect_to_publishers - Found {len(publishers)} publishers")
                 
-                # Parse the leader data (should be in format "address:port|expiry")
-                if "|" in leader_data_str:
-                    leader_addr = leader_data_str.split("|")[0]
-                    leader_ip = leader_addr.split(":")[0]
-                    
-                    # Create SUB socket to listen to leader
-                    if hasattr(self, 'replication_listener') and self.replication_listener:
-                        self.poller.unregister(self.replication_listener)
-                        self.replication_listener.close()
-                    
-                    self.replication_listener = self.context.socket(zmq.SUB)
-                    self.replication_listener.connect(f"tcp://{leader_ip}:7000")
-                    self.replication_listener.setsockopt_string(zmq.SUBSCRIBE, "")
-                    self.poller.register(self.replication_listener, zmq.POLLIN)
-                    self.logger.info(f"BrokerMW::setup_follower_replication - Listening to leader at {leader_ip}:7000")
-                else:
-                    self.logger.error(f"BrokerMW::setup_follower_replication - Invalid leader data format: {leader_data_str}")
-            else:
-                self.logger.warning("BrokerMW::setup_follower_replication - No leader found")
-                
-        except Exception as e:
-            self.logger.error(f"BrokerMW::setup_follower_replication - Error: {str(e)}")
-
-    ########################################
-    # Get Follower Brokers
-    ########################################
-    def get_follower_brokers(self):
-        """Get list of follower brokers"""
-        self.follower_brokers = []
-        
-        try:
-            if self.zk.exists(self.broker_path):
-                brokers = self.zk.get_children(self.broker_path)
-                
-                for broker_id in brokers:
-                    if broker_id == "leader":
-                        continue
-                        
-                    broker_path = f"{self.broker_path}/{broker_id}"
-                    if self.zk.exists(broker_path):
-                        broker_data, _ = self.zk.get(broker_path)
-                        broker_address = broker_data.decode()
-                        
-                        # Skip any empty or invalid addresses
-                        if not broker_address or ":" not in broker_address:
-                            self.logger.warning(f"BrokerMW::get_follower_brokers - Found invalid broker address: '{broker_address}' for {broker_id}")
-                            continue
-                        
-                        # Avoid adding our own address to follower list
-                        own_address = f"{self.addr}:{self.port}"
-                        if broker_address != own_address:
-                            self.follower_brokers.append(broker_address)
-                
-                # Log only valid follower brokers
-                self.logger.info(f"BrokerMW::get_follower_brokers - Found {len(self.follower_brokers)} followers: {self.follower_brokers}")
-        except Exception as e:
-            self.logger.error(f"BrokerMW::get_follower_brokers - Error: {str(e)}")
-    
-    ########################################
-    # Periodic Follower Sync
-    ########################################
-    def periodic_follower_sync(self):
-        """Periodically update the follower broker list"""
-        while self.is_primary:
-            try:
-                self.get_follower_brokers()
-                time.sleep(5)
-            except Exception as e:
-                self.logger.error(f"BrokerMW::periodic_follower_sync - Error: {str(e)}")
-                if not self.is_primary:
-                    break
-
-    ########################################
-    # Subscribe to Publishers
-    ########################################
-    def subscribe_to_publishers(self):
-        """Subscribe to all registered publishers"""
-        try:
-            self.logger.info("BrokerMW::subscribe_to_publishers - Checking for publishers in ZooKeeper")
-            
-            if self.zk.exists(self.publisher_path):
-                publishers = self.zk.get_children(self.publisher_path)
-                self.logger.info(f"BrokerMW::subscribe_to_publishers - Found {len(publishers)} publishers: {publishers}")
-                
+                # Connect to each publisher
                 for pub_id in publishers:
-                    pub_node_path = f"{self.publisher_path}/{pub_id}"
-                    if self.zk.exists(pub_node_path):
-                        pub_data, _ = self.zk.get(pub_node_path)
-                        pub_address = pub_data.decode()
-                        connection_url = f"tcp://{pub_address}"
-                        self.sub.connect(connection_url)
-                        self.logger.info(f"BrokerMW::subscribe_to_publishers - Connected to Publisher {pub_id} at {connection_url}")
-            else:
-                self.logger.warning(f"BrokerMW::subscribe_to_publishers - Path {self.publisher_path} doesn't exist yet")
+                    pub_path = f"/publishers/{pub_id}"
+                    if self.zk.exists(pub_path):
+                        data, _ = self.zk.get(pub_path)
+                        pub_addr = data.decode()
+                        if pub_addr:
+                            conn_str = f"tcp://{pub_addr}"
+                            self.sub.connect(conn_str)
+                            self.logger.info(f"BrokerMW::connect_to_publishers - Connected to {pub_id} at {conn_str}")
                 
         except Exception as e:
-            self.logger.error(f"BrokerMW::subscribe_to_publishers - Error: {str(e)}")
-
-    ########################################
-    # Handle Publisher Changes
-    ########################################
-    def handle_publisher_change(self, children):
-        """Handle changes in the publisher list"""
+            self.logger.error(f"BrokerMW::connect_to_publishers - Exception: {str(e)}")
+    
+    def handle_publisher_change(self, publishers):
+        """Handle changes to the publisher list in ZooKeeper"""
         try:
-            self.logger.info(f"BrokerMW::handle_publisher_change - Publisher list changed: {children}")
+            self.logger.info(f"BrokerMW::handle_publisher_change - Publisher list changed: {publishers}")
             
-            # Create new socket before closing old one
+            # Since ZMQ SUB can't easily disconnect from specific endpoints,
+            # we need to create a new socket and reconnect to all publishers
             new_sub = self.context.socket(zmq.SUB)
-            new_sub.setsockopt_string(zmq.SUBSCRIBE, "")  # Receive all topics
+            new_sub.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all topics
             
-            # Connect to all publishers with new socket
-            if self.zk.exists(self.publisher_path):
-                publishers = self.zk.get_children(self.publisher_path)
-                for pub_id in publishers:
-                    try:
-                        pub_node_path = f"{self.publisher_path}/{pub_id}"
-                        if self.zk.exists(pub_node_path):
-                            pub_data, _ = self.zk.get(pub_node_path)
-                            pub_address = pub_data.decode()
-                            new_sub.connect(f"tcp://{pub_address}")
-                            self.logger.info(f"BrokerMW::handle_publisher_change - Connected to Publisher {pub_id} at {pub_address}")
-                    except Exception as e:
-                        self.logger.error(f"BrokerMW::handle_publisher_change - Error connecting to publisher {pub_id}: {str(e)}")
+            # Connect to all current publishers
+            for pub_id in publishers:
+                try:
+                    pub_path = f"/publishers/{pub_id}"
+                    if self.zk.exists(pub_path):
+                        data, _ = self.zk.get(pub_path)
+                        pub_addr = data.decode()
+                        if pub_addr:
+                            conn_str = f"tcp://{pub_addr}"
+                            new_sub.connect(conn_str)
+                            self.logger.info(f"BrokerMW::handle_publisher_change - Connected to {pub_id} at {conn_str}")
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::handle_publisher_change - Error connecting to {pub_id}: {str(e)}")
             
-            # Update the poller to use the new socket
-            try:
-                if self.sub:
-                    self.poller.unregister(self.sub)
-                    self.sub.close()
-            except Exception as e:
-                self.logger.error(f"BrokerMW::handle_publisher_change - Error unregistering old socket: {str(e)}")
-                
-            # Assign new socket and register with poller
+            # Update poller and close old socket
+            if self.sub:
+                self.poller.unregister(self.sub)
+                self.sub.close()
+            
             self.sub = new_sub
             self.poller.register(self.sub, zmq.POLLIN)
+            self.logger.info("BrokerMW::handle_publisher_change - Updated publisher connections")
             
         except Exception as e:
-            self.logger.error(f"BrokerMW::handle_publisher_change - Error: {str(e)}")
-
-    ########################################
-    # Event Loop
-    ########################################
+            self.logger.error(f"BrokerMW::handle_publisher_change - Exception: {str(e)}")
+    
     def event_loop(self, timeout=None):
-        """Process events for specified timeout then return control to application"""
+        """Process events for the specified timeout"""
         try:
-            # Check if quorum revival is in progress
-            revival_flag_path = f"{self.quorum_path}/revival_in_progress"
-            if self.zk.exists(revival_flag_path):
-                # Add timeout check to automatically clear stuck revival flags
-                data, stat = self.zk.get(revival_flag_path)
-                revival_start_time = stat.ctime/1000  # ZK times are in milliseconds
-                
-                # If revival has been in progress for more than 2 minutes, clear the flag
-                if time.time() - revival_start_time > 120:
-                    self.logger.warning("BrokerMW::event_loop - Revival has been stuck for too long, clearing flag")
-                    self.zk.delete(revival_flag_path)
-                    self.reviving = False
-                    return
-                    
-                self.logger.warning("BrokerMW::event_loop - Quorum revival in progress, operations blocked")
-                time.sleep(1)  # Sleep briefly and return
-                return
-            
-            # Normal processing continues when not in revival
-            # Poll for events with the specified timeout
+            # Poll for events
             events = dict(self.poller.poll(timeout=timeout))
             
-            if not events and self.upcall_obj:
-                # No events within timeout, let application decide what to do
-                return
-            
-            # Handle messages from publishers
-            if self.sub and self.sub in events:
-                # Receive the message
-                topic_and_message = self.sub.recv_string()
-                topic, message = topic_and_message.split(":", 1)
+            # Handle incoming messages from publishers
+            if self.sub in events:
+                message = self.sub.recv()
                 
-                self.logger.info(f"BrokerMW::event_loop - Received topic [{topic}] with message [{message}]")
+                # Forward message to subscribers
+                if self.pub:
+                    self.pub.send(message)
                 
-                # Primary broker forwards to subscribers directly and replicates
-                if self.is_primary and self.pub:
-                    self.pub.send_string(topic_and_message)
-                    self.logger.info(f"BrokerMW::event_loop - Primary forwarded message on topic [{topic}]")
+                # If primary, replicate to backups
+                if self.is_primary and self.repl_pub:
+                    self.repl_pub.send(message)
                     
-                    # Replicate to follower brokers
-                    if hasattr(self, 'replication_socket') and self.replication_socket:
-                        try:
-                            self.replication_socket.send_string(topic_and_message)
-                            self.logger.debug(f"BrokerMW::event_loop - Replicated message to followers")
-                        except Exception as e:
-                            self.logger.error(f"BrokerMW::event_loop - Failed to replicate message: {str(e)}")
-                
                 # Let application know we processed something
                 if self.upcall_obj:
                     self.upcall_obj.invoke_operation()
             
-            # Handle replication messages (if follower)
-            elif hasattr(self, 'replication_listener') and self.replication_listener in events:
-                replica_message = self.replication_listener.recv_string()
-                topic, message = replica_message.split(":", 1)
-                
-                self.logger.info(f"BrokerMW::event_loop - Follower received replicated topic [{topic}] with message [{message}]")
+            # Handle replicated messages from primary (if backup)
+            elif hasattr(self, 'repl_sub') and self.repl_sub and self.repl_sub in events:
+                message = self.repl_sub.recv()
                 
                 # Forward replicated message to subscribers
                 if self.pub:
-                    self.pub.send_string(replica_message)
+                    self.pub.send(message)
                 
                 # Let application know we processed something
                 if self.upcall_obj:
@@ -585,30 +227,30 @@ class BrokerMW():
                 
         except Exception as e:
             self.logger.error(f"BrokerMW::event_loop - Exception: {str(e)}")
-            # Log the full traceback for debugging
-            import traceback
-            self.logger.error(f"BrokerMW::event_loop - Traceback: {traceback.format_exc()}")
     
-    ########################################
-    # Set Upcall Handle
-    ########################################
     def set_upcall_handle(self, upcall_obj):
-        """Set the upcall object for application-level callbacks"""
-        self.logger.info("BrokerMW::set_upcall_handle - Setting upcall handle")
+        """Set the upcall object"""
         self.upcall_obj = upcall_obj
-
-    ########################################
-    # Cleanup
-    ########################################
+        self.logger.info("BrokerMW::set_upcall_handle - Upcall handle set")
+    
+    def update_role(self, is_primary):
+        """Update our role (primary or backup)"""
+        if self.is_primary != is_primary:
+            self.logger.info(f"BrokerMW::update_role - Role changing from {'primary' if self.is_primary else 'backup'} to {'primary' if is_primary else 'backup'}")
+            self.is_primary = is_primary
+            
+            # Reconfigure replication based on new role
+            if self.is_primary:
+                self.setup_primary_replication()
+            else:
+                self.setup_backup_replication()
+    
     def cleanup(self):
         """Clean up all resources"""
         try:
             self.logger.info("BrokerMW::cleanup - Cleaning up resources")
             
-            # Make sure we're no longer primary
-            self.is_primary = False
-            
-            # Clean up sockets
+            # Close sockets
             if self.sub:
                 self.poller.unregister(self.sub)
                 self.sub.close()
@@ -616,262 +258,77 @@ class BrokerMW():
             if self.pub:
                 self.pub.close()
                 
-            if hasattr(self, 'replication_socket') and self.replication_socket:
-                self.replication_socket.close()
+            if hasattr(self, 'repl_pub') and self.repl_pub:
+                self.repl_pub.close()
                 
-            if hasattr(self, 'replication_listener') and self.replication_listener:
-                self.poller.unregister(self.replication_listener)
-                self.replication_listener.close()
-            
-            # Remove quorum revival flag if we created it
-            revival_flag_path = f"{self.quorum_path}/revival_in_progress"
-            if self.zk.exists(revival_flag_path):
-                try:
-                    data, stat = self.zk.get(revival_flag_path)
-                    self.zk.delete(revival_flag_path)
-                except Exception as e:
-                    self.logger.error(f"BrokerMW::cleanup - Error removing revival flag: {str(e)}")
+            if hasattr(self, 'repl_sub') and self.repl_sub:
+                self.poller.unregister(self.repl_sub)
+                self.repl_sub.close()
                 
             # Terminate ZMQ context
             self.context.term()
             
         except Exception as e:
-            self.logger.error(f"BrokerMW::cleanup - Error: {str(e)}")
+            self.logger.error(f"BrokerMW::cleanup - Exception: {str(e)}")
 
-    ########################################
-    # Start Quorum Monitoring
-    ########################################
-    def start_quorum_monitoring(self):
-        """Start monitoring the broker quorum to maintain 3 replicas"""
-        # Start the monitoring thread
-        self.quorum_thread = threading.Thread(target=self.quorum_monitoring_task, daemon=True)
-        self.quorum_thread.start()
-        self.logger.info("BrokerMW::start_quorum_monitoring - Quorum monitoring thread started")
-
-    ########################################
-    # Quorum Monitoring Task
-    ########################################
-    def quorum_monitoring_task(self):
-        self.logger.info("BrokerMW::quorum_monitoring_task - Starting quorum monitoring")
-        
-        while self.is_primary:
-            try:
-                # Get current broker count
-                valid_brokers = []
-                if self.zk.exists(self.broker_path):
-                    brokers = self.zk.get_children(self.broker_path)
-                    # Filter out the "leader" node which isn't a broker instance
-                    for broker_id in brokers:
-                        if broker_id == "leader":
-                            continue
-                        
-                        broker_path = f"{self.broker_path}/{broker_id}"
-                        if self.zk.exists(broker_path):
-                            broker_data, _ = self.zk.get(broker_path)
-                            broker_address = broker_data.decode()
-                            
-                            # Skip any empty or invalid addresses
-                            if not broker_address or ":" not in broker_address:
-                                self.logger.warning(f"BrokerMW::quorum_monitoring_task - Found invalid broker address: '{broker_address}' for {broker_id}")
-                                
-                                # Clean up invalid node
-                                try:
-                                    self.zk.delete(broker_path)
-                                    self.logger.info(f"BrokerMW::quorum_monitoring_task - Cleaned up invalid broker node: {broker_path}")
-                                except Exception as e:
-                                    self.logger.error(f"BrokerMW::quorum_monitoring_task - Failed to clean up invalid node: {str(e)}")
-                                
-                                continue
-                            
-                            valid_brokers.append(broker_address)
-                
-                broker_count = len(valid_brokers)
-                self.logger.info(f"BrokerMW::quorum_monitoring_task - Current broker count: {broker_count}")
-                
-                # Check if we need to revive brokers
-                if broker_count < self.quorum_size and not self.reviving:
-                    self.logger.warning(f"BrokerMW::quorum_monitoring_task - Broker count below quorum ({broker_count}/{self.quorum_size})")
-                    
-                    # Number of brokers to revive
-                    to_revive = self.quorum_size - broker_count
-                    
-                    # Lock operations during revival
-                    self.reviving = True
-                    
-                    # Create a flag in ZooKeeper to indicate revival in progress
-                    self.zk.ensure_path(self.quorum_path)
-                    revival_flag_path = f"{self.quorum_path}/revival_in_progress"
-                    if not self.zk.exists(revival_flag_path):
-                        self.zk.create(revival_flag_path, b"true", ephemeral=True)
-                    
-                    # Start revival in a separate thread to avoid blocking monitor
-                    revival_thread = threading.Thread(
-                        target=self.revive_broker_replicas, 
-                        args=(to_revive, revival_flag_path),
-                        daemon=True
-                    )
-                    revival_thread.start()
-                
-            except Exception as e:
-                self.logger.error(f"BrokerMW::quorum_monitoring_task - Error: {str(e)}")
-                import traceback
-                self.logger.error(f"BrokerMW::quorum_monitoring_task - Traceback: {traceback.format_exc()}")
-            
-            # Sleep before next check
-            time.sleep(self.quorum_check_interval)
-        
-        self.logger.info("BrokerMW::quorum_monitoring_task - Quorum monitoring stopped")
-
-    ########################################
-    # Revive Broker Replicas
-    ########################################
-    def revive_broker_replicas(self, count, revival_flag_path):
-        """Revive the specified number of broker replicas using broker agents"""
-        revival_start = time.time()
+    def driver(self):
         try:
-            self.logger.info(f"BrokerMW::revive_broker_replicas - Reviving {count} broker replicas")
+            self.logger.info("BrokerAppln::driver - Starting event loop")
             
-            # First, find available broker agents
-            agents = self.get_available_broker_agents()
-            if not agents:
-                self.logger.error("BrokerMW::revive_broker_replicas - No broker agents available")
-                return
+            # Run the main event loop
+            while True:
+                self.mw_obj.event_loop(timeout=100)  # 100ms timeout
+                time.sleep(0.01)  # Small sleep to prevent CPU spinning
                 
-            self.logger.info(f"BrokerMW::revive_broker_replicas - Found {len(agents)} available broker agents: {agents}")
-            
-            # Only use each agent once per revival cycle
-            brokers_to_revive = min(count, len(agents))
-            
-            # Get current broker addresses to avoid spawning on machines that already have brokers
-            current_brokers = set()
-            if self.zk.exists(self.broker_path):
-                for broker_id in self.zk.get_children(self.broker_path):
-                    if broker_id == "leader":
-                        continue
-                    broker_path = f"{self.broker_path}/{broker_id}"
-                    if self.zk.exists(broker_path):
-                        data, _ = self.zk.get(broker_path)
-                        addr = data.decode().split(':')[0]  # Just get the IP part
-                        current_brokers.add(addr)
-            
-            # Filter agents to prefer those not already running brokers
-            preferred_agents = [a for a in agents if a['host'] not in current_brokers]
-            if not preferred_agents:
-                preferred_agents = agents  # Fall back to all agents if necessary
-            
-            # Use randomization to avoid always picking the same agents
-            random.shuffle(preferred_agents)
-            
-            # Track successfully spawned brokers
-            successful_spawns = 0
-            
-            for i in range(brokers_to_revive):
-                # Check if we've been trying too long
-                if time.time() - revival_start > 90:  # 90 second safety timeout
-                    self.logger.error("BrokerMW::revive_broker_replicas - Revival taking too long, aborting")
-                    break
-                    
-                # Use modulo to wrap around the agent list if needed
-                agent_idx = i % len(preferred_agents)
-                agent = preferred_agents[agent_idx]
-                
-                new_port = 5556 + i  # Assumes unique port assignment per broker
-                replica_name = f"broker_replica_{int(time.time())}_{i}"
-                
-                self.logger.info(f"BrokerMW::revive_broker_replicas - Requesting agent {agent['host']}:{agent['port']} to start replica {replica_name}")
-                
-                # Connect to the agent with timeout settings
-                context = zmq.Context()
-                socket = context.socket(zmq.REQ)
-                socket.setsockopt(zmq.LINGER, 0)  # Don't wait on close
-                socket.setsockopt(zmq.RCVTIMEO, 10000)  # 10 second receive timeout
-                socket.setsockopt(zmq.SNDTIMEO, 10000)  # 10 second send timeout
-                
-                try:
-                    socket.connect(f"tcp://{agent['host']}:{agent['port']}")
-                    
-                    # Send spawn request
-                    request = {
-                        'action': 'spawn_broker',
-                        'name': replica_name,
-                        'port': new_port,
-                        'zookeeper': self.args.zookeeper  # Pass ZK address
-                    }
-                    
-                    socket.send_json(request)
-                    response = socket.recv_json()
-                    
-                    # Process response
-                    if response.get('status') == 'ok':
-                        self.logger.info(f"BrokerMW::revive_broker_replicas - Successfully spawned broker {replica_name} on {agent['host']}:{new_port}")
-                        successful_spawns += 1
-                        
-                        # Wait a bit for the new broker to register
-                        time.sleep(1)
-                    else:
-                        self.logger.error(f"BrokerMW::revive_broker_replicas - Failed to spawn broker: {response}")
-                    
-                except zmq.error.Again:
-                    self.logger.error(f"BrokerMW::revive_broker_replicas - Timeout communicating with agent at {agent['host']}:{agent['port']}")
-                except Exception as e:
-                    self.logger.error(f"BrokerMW::revive_broker_replicas - Error with agent: {str(e)}")
-                finally:
-                    socket.close()
-                    context.term()
-                
-                # Monitor overall progress
-                if successful_spawns >= count:
-                    self.logger.info(f"BrokerMW::revive_broker_replicas - Successfully spawned all {count} requested brokers")
-                    break
-                
-            if successful_spawns < count:
-                self.logger.warning(f"BrokerMW::revive_broker_replicas - Only spawned {successful_spawns}/{count} requested brokers")
-                
+        except KeyboardInterrupt:
+            self.logger.info("BrokerAppln::driver - KeyboardInterrupt received")
+            self.cleanup()
         except Exception as e:
-            self.logger.error(f"BrokerMW::revive_broker_replicas - Error: {str(e)}")
-        finally:
-            # Always remove the revival flag
-            try:
-                if self.zk.exists(revival_flag_path):
-                    self.logger.info("BrokerMW::revive_broker_replicas - Removing revival flag")
-                    self.zk.delete(revival_flag_path)
-            except Exception as e:
-                self.logger.error(f"BrokerMW::revive_broker_replicas - Error removing revival flag: {str(e)}")
-            self.reviving = False
-            self.logger.info("BrokerMW::revive_broker_replicas - Revival process completed")
+            self.logger.error(f"BrokerAppln::driver - Exception: {str(e)}")
+            self.cleanup()
 
-    ########################################
-    # Get Available Broker Agents
-    ########################################
-    def get_available_broker_agents(self):
-        """Get a list of available broker agents from ZooKeeper"""
-        agents = []
-        agent_path = "/broker_agents"
-        
+    def signal_handler(self, signum, frame):
+        self.logger.info(f"BrokerAppln::signal_handler - Received signal {signum}")
+        self.cleanup()
+        sys.exit(0)
+
+    def cleanup(self):
+        """Clean up resources and deregister from ZooKeeper"""
         try:
-            # Ensure the path exists
-            self.zk.ensure_path(agent_path)
+            self.logger.info("BrokerAppln::cleanup - Performing cleanup operations")
             
-            # Get all registered agents
-            if self.zk.exists(agent_path):
-                agent_nodes = self.zk.get_children(agent_path)
+            # Stop the lease renewal thread if it's running
+            self.is_primary = False
+            if self.lease_thread and self.lease_thread.is_alive():
+                self.lease_thread.join(timeout=2)
                 
-                for node in agent_nodes:
-                    node_path = f"{agent_path}/{node}"
-                    data, _ = self.zk.get(node_path)
-                    host, port = data.decode().split(':')
-                    
-                    agents.append({
-                        'host': host,
-                        'port': int(port)
-                    })
-                    
-                self.logger.info(f"BrokerMW::get_available_broker_agents - Found {len(agents)} broker agents")
+            # Explicitly delete our leader node if we're the primary
+            if self.zk and self.zk.connected and self.leader_path:
+                if self.zk.exists(self.leader_path):
+                    try:
+                        data, _ = self.zk.get(self.leader_path)
+                        our_addr = f"{self.args.addr}:{self.args.port}"
+                        
+                        # Only delete if it's our node
+                        if data and our_addr in data.decode():
+                            self.logger.info("BrokerAppln::cleanup - Deleting our leader node from ZooKeeper")
+                            self.zk.delete(self.leader_path)
+                    except Exception as e:
+                        self.logger.warning(f"BrokerAppln::cleanup - Error deleting leader node: {e}")
+            
+            # Close the ZooKeeper connection
+            if self.zk:
+                self.logger.info("BrokerAppln::cleanup - Closing ZooKeeper connection")
+                self.zk.stop()
+                self.zk.close()
                 
-            return agents
-        
+            # Close middleware resources
+            if self.mw_obj and hasattr(self.mw_obj, 'cleanup'):
+                self.mw_obj.cleanup()
+                
+            self.logger.info("BrokerAppln::cleanup - Cleanup complete")
+            
         except Exception as e:
-            self.logger.error(f"BrokerMW::get_available_broker_agents - Error: {str(e)}")
-            return []
+            self.logger.error(f"BrokerAppln::cleanup - Error during cleanup: {e}")
 
 

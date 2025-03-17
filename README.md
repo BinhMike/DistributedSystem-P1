@@ -38,30 +38,29 @@ python3 PublisherAppln.py -n pub2 -a localhost -p 5578 -z localhost:2181 -T 2 -f
 Run the broker:
 
 (vm4)
-(primary) (need to run brokerAppln with --agent on all machines first, then start regular broker on 1 machine)
 python3 BrokerAppln.py -n broker1 -a 192.168.5.166 -p 5554 -z 192.168.5.91:2181
 
-python3 BrokerAppln.py --agent -a 192.168.5.166 -p 5555 -z 192.168.5.91:2181
-
 (vm5)
-python3 BrokerAppln.py --agent -a 192.168.5.226 -p 5555 -z 192.168.5.91:2181
+python3 BrokerAppln.py -n broker2 -a 192.168.5.226 -p 5555 -z 192.168.5.91:2181
 
 (vm6)
-python3 BrokerAppln.py --agent -a 192.168.5.234 -p 5555 -z 192.168.5.91:2181
+python3 BrokerAppln.py -n broker3 -a 192.168.5.234 -p 5556 -z 192.168.5.91:2181
 
 
 (localhost)
-python3 BrokerAppln.py -n broker1 -p 6000 --addr localhost -z localhost:2181
-
-python3 BrokerAppln.py -n broker2 -p 6001 --addr localhost -z localhost:2181
-
-python3 BrokerAppln.py -n broker3 -p 6002 --addr localhost -z localhost:2181
+python3 BrokerAppln.py -n broker1 -a localhost -p 6000 -z localhost:2181
+python3 BrokerAppln.py -n broker2 -a localhost -p 6001 -z localhost:2181
+python3 BrokerAppln.py -n broker3 -a localhost -p 6002 -z localhost:2181
 
 
 Run the subscriber：
 (vm7)
-python3 SubscriberAppln.py -n sub1 -z localhost:2181 -T 9 -l 20
+python3 SubscriberAppln.py -n sub1 -z 192.168.5.91:2181 -T 9 -l 20
+python3 SubscriberAppln.py -n sub2 -z 192.168.5.91:2181 -T 9 -l 20
 
+
+(localhost)
+python3 SubscriberAppln.py -n sub1 -z localhost:2181 -T 9 -l 20
 python3 SubscriberAppln.py -n sub2 -z localhost:2181 -T 9 -l 20
 
 
@@ -74,9 +73,8 @@ To run Zookeeper:
 ./zkCli.sh
 
 ls /discovery/leader
-
+ls /broker/leader
 ls /subscribers
-
 ls /publishers
 
 If you want to see the data stored in a particular node:
@@ -88,25 +86,25 @@ ls <path> lists the children of a given znode where your discovery service may h
 get <path> displays the data stored in a znode.
 
 
+**Testing Quorum and Leadership Failover Locally:
 
-**Test Entire WorkFlow locally for Discovery replication, lease, and quorum:
-Start your Discovery service:
+1. Start three instances of Discovery service:
 python3 DiscoveryAppln.py -p 5555 -a localhost -z localhost:2181
-
 python3 DiscoveryAppln.py -p 5556 -a localhost -z localhost:2181
-
 python3 DiscoveryAppln.py -p 5557 -a localhost -z localhost:2181
 
+2. Start three instances of Broker service:
+python3 BrokerAppln.py -n broker1 -a localhost -p 6000 -z localhost:2181
+python3 BrokerAppln.py -n broker2 -a localhost -p 6001 -z localhost:2181
+python3 BrokerAppln.py -n broker3 -a localhost -p 6002 -z localhost:2181
 
-Run the Publisher:
+3. Run Publisher and Subscriber:
 python3 PublisherAppln.py -n pub1 -a localhost -p 5577 -z localhost:2181 -T 2 -f 1 -i 1000 -l 20
-
-
-
-Run the subscriber：
 python3 SubscriberAppln.py -n sub1 -z localhost:2181 -T 9 -l 20
 
-
-Then, manually quit one or several Discovery replicas. New terminal windows would be automatically popped up with newly spawned Discovery replica to maintain quorum of 3.
+4. Testing Failover:
+   - Manually terminate the primary Discovery or Broker instance (the one showing "became primary" in logs)
+   - Watch as another instance takes over leadership
+   - Verify a new replica is spawned automatically to maintain the quorum of 3
 
 
