@@ -10,14 +10,25 @@ python3 DiscoveryAppln.py -p 5555 -a 192.168.5.91 -z localhost:2181
 (vm2)
 python3 DiscoveryAppln.py -p 5555 -a 192.168.5.55 -z 192.168.5.91:2181
 (vm3)
-fill this out plz
+python3 DiscoveryAppln.py -p 5555 -a 192.168.5.230 -z 192.168.5.91:2181
+
 
 (localhost)
 python3 DiscoveryAppln.py -p 5555 -a localhost -z localhost:2181
 python3 DiscoveryAppln.py -p 5556 -a localhost -z localhost:2181
+python3 DiscoveryAppln.py -p 5557 -a localhost -z localhost:2181
 
+
+we only have 7 so we'll just use vm7 for pub and sub
 
 Run the Publisher:
+
+(vm7) 
+python3 PublisherAppln.py -n pub1 -a 192.168.5.249 -p 5577 -z 192.168.5.91:2181 -T 2 -f 1 -i 1000 -l 20
+python3 PublisherAppln.py -n pub2 -a 192.168.5.249 -p 5578 -z 192.168.5.91:2181 -T 2 -f 1 -i 1000 -l 20
+
+
+
 (localhost)
 python3 PublisherAppln.py -n pub1 -a localhost -p 5577 -z localhost:2181 -T 2 -f 1 -i 1000 -l 20
 
