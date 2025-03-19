@@ -230,25 +230,11 @@ class BrokerAppln():
         self.lease_thread.start()
         self.logger.info("BrokerAppln::start_lease_renewal - Lease renewal thread started.")
     
-    def driver(self):
-        try:
-            self.logger.info("BrokerAppln::driver - Starting event loop")
-            
-            # Run the main event loop
-            while True:
-                self.mw_obj.event_loop(timeout=100)  # 100ms timeout
-                time.sleep(0.01)  # Small sleep to prevent CPU spinning
-                
-        except KeyboardInterrupt:
-            self.logger.info("BrokerAppln::driver - KeyboardInterrupt received")
-            self.cleanup()
-        except Exception as e:
-            self.logger.error(f"BrokerAppln::driver - Exception: {str(e)}")
-            self.cleanup()
-    
     def invoke_operation(self):
-        """Invoked by the middleware event loop when timeout occurs"""
-        return None
+        """Invoked by the middleware when a message is processed"""
+        # This method can be empty or contain minimal logging
+        # since we're just using it as a callback notification
+        pass
     
     def signal_handler(self, signum, frame):
         self.logger.info(f"BrokerAppln::signal_handler - Received signal {signum}")
@@ -315,6 +301,34 @@ class BrokerAppln():
                 print_tree(child_path, level + 1)
         print_tree("/")
 
+    def quorum_met(self):
+        """Return True if at least 3 Broker replicas are registered."""
+        try:
+            replicas = self.zk.get_children(self.replicas_path)
+            self.logger.info(f"Quorum check: {len(replicas)} replicas present.")
+            return len(replicas) >= 3
+        except Exception as e:
+            self.logger.error(f"Error checking quorum: {str(e)}")
+            return False
+
+    def run(self):
+        """ Run Broker Service Event Loop """
+        self.logger.info("BrokerAppln::run - entering event loop")
+        try:
+            # Register cleanup handlers
+            atexit.register(self.cleanup)
+            # Run the event loop
+            while True:
+                self.mw_obj.event_loop(timeout=100)  # 100ms timeout
+                time.sleep(0.01)  # Small sleep to prevent CPU spinning
+        except KeyboardInterrupt:
+            self.logger.info("KeyboardInterrupt received, shutting down")
+        except Exception as e:
+            self.logger.error(f"Exception in event loop: {e}")
+        finally:
+            # Ensure cleanup happens
+            self.cleanup()
+
 def parseCmdLineArgs():
     parser = argparse.ArgumentParser(description="Broker Application")
     parser.add_argument("-n", "--name", default="broker", help="Broker name")
@@ -330,17 +344,15 @@ def main():
     args = parseCmdLineArgs()
     logger.setLevel(args.loglevel)
     
-    # Register cleanup handler
-    atexit.register(lambda: None)  # Placeholder - actual cleanup will be done by the app
-    
     app = BrokerAppln(logger)
     
     try:
         app.configure(args)
-        app.driver()
+        app.run()
     except Exception as e:
         logger.error(f"Exception in main: {e}")
-        app.cleanup()
+        if hasattr(app, 'cleanup'):
+            app.cleanup()
         sys.exit(1)
 
 if __name__ == "__main__":

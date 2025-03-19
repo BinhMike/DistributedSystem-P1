@@ -227,6 +227,7 @@ class BrokerMW:
                 
         except Exception as e:
             self.logger.error(f"BrokerMW::event_loop - Exception: {str(e)}")
+            raise e  # Re-raise to allow proper handling in application
     
     def set_upcall_handle(self, upcall_obj):
         """Set the upcall object"""
@@ -270,22 +271,6 @@ class BrokerMW:
             
         except Exception as e:
             self.logger.error(f"BrokerMW::cleanup - Exception: {str(e)}")
-
-    def driver(self):
-        try:
-            self.logger.info("BrokerAppln::driver - Starting event loop")
-            
-            # Run the main event loop
-            while True:
-                self.mw_obj.event_loop(timeout=100)  # 100ms timeout
-                time.sleep(0.01)  # Small sleep to prevent CPU spinning
-                
-        except KeyboardInterrupt:
-            self.logger.info("BrokerAppln::driver - KeyboardInterrupt received")
-            self.cleanup()
-        except Exception as e:
-            self.logger.error(f"BrokerAppln::driver - Exception: {str(e)}")
-            self.cleanup()
 
     def signal_handler(self, signum, frame):
         self.logger.info(f"BrokerAppln::signal_handler - Received signal {signum}")
