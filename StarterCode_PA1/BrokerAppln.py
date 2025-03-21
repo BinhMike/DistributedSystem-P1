@@ -182,8 +182,8 @@ class BrokerAppln():
         try:
             self.name = args.name 
             self.args = args
-            config_obj = configparser.ConfigParser()
-            config_obj.read(args.config)
+            # config_obj = configparser.ConfigParser()
+            # config_obj.read(args.config)
 
             # Connect to ZooKeeper
             self.logger.info(f"BrokerAppln::configure - Connecting to ZooKeeper at {args.zookeeper}")
