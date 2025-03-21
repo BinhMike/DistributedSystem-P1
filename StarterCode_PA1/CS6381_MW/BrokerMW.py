@@ -28,6 +28,10 @@ class BrokerMW:
         self.port = None         # Our port
         self.zk = None           # ZooKeeper client (shared with app)
         self.is_primary = False  # Whether this instance is the primary
+        self.discovery_addr = None  # Add this to track Discovery service address
+        
+        # Message queue for tracking received messages
+        self.message_queue = []
         
         # Replication sockets
         self.repl_pub = None     # PUB socket for sending replication data (primary)
@@ -57,6 +61,13 @@ class BrokerMW:
             self.sub.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all topics
             self.poller.register(self.sub, zmq.POLLIN)
             self.logger.info("BrokerMW::configure - SUB socket created")
+            
+            # Add REQ socket for Discovery communications
+            self.req = self.context.socket(zmq.REQ)
+            discovery_url = f"tcp://{args.addr}:{5555}"  # Default Discovery port
+            self.req.connect(discovery_url)
+            self.logger.info(f"BrokerMW::configure - Connected to Discovery at {discovery_url}")
+            self.discovery_addr = f"{args.addr}:{5555}"
             
             # Set up replication based on role
             if self.is_primary:
@@ -103,10 +114,10 @@ class BrokerMW:
                 self.repl_pub.close()
                 self.repl_pub = None
                 
-            # Get leader address
+            # Get leader address - Fix path to match the new path structure
             leader_data = None
-            if self.zk.exists("/broker/leader"):
-                data, _ = self.zk.get("/broker/leader")
+            if self.zk.exists("/brokers/leader"):  # Changed from "/broker/leader"
+                data, _ = self.zk.get("/brokers/leader")  # Changed from "/broker/leader"
                 leader_data = data.decode()
                 
             if leader_data and '|' in leader_data:
@@ -179,55 +190,113 @@ class BrokerMW:
                 except Exception as e:
                     self.logger.error(f"BrokerMW::handle_publisher_change - Error connecting to {pub_id}: {str(e)}")
             
-            # Update poller and close old socket
-            if self.sub:
-                self.poller.unregister(self.sub)
-                self.sub.close()
+            # Save the old socket first to avoid race conditions
+            old_sub = self.sub
             
+            # Safely update poller and socket - register new socket first
+            self.poller.register(new_sub, zmq.POLLIN)
             self.sub = new_sub
-            self.poller.register(self.sub, zmq.POLLIN)
+            
+            # Then unregister and close old socket
+            if old_sub:
+                try:
+                    self.poller.unregister(old_sub)
+                    old_sub.close()
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::handle_publisher_change - Error closing old socket: {str(e)}")
+            
             self.logger.info("BrokerMW::handle_publisher_change - Updated publisher connections")
             
         except Exception as e:
             self.logger.error(f"BrokerMW::handle_publisher_change - Exception: {str(e)}")
     
-    def event_loop(self, timeout=None):
-        """Process events for the specified timeout"""
+    def forward_messages(self):
+        """Process and forward any messages from publishers to subscribers"""
         try:
-            # Poll for events
-            events = dict(self.poller.poll(timeout=timeout))
+            # If there are no buffered messages, try to receive some (non-blocking)
+            if not self.message_queue:
+                try:
+                    # Poll for events
+                    events = dict(self.poller.poll(timeout=0))  # Non-blocking poll
+                    
+                    # Handle incoming messages from publishers (with safety checks)
+                    if self.sub and self.sub in events:
+                        message = self.sub.recv(zmq.NOBLOCK)
+                        self.message_queue.append(message)
+                        self.logger.debug(f"BrokerMW::forward_messages - Received message, added to queue")
+                    
+                    # Handle replicated messages from primary (if backup)
+                    elif hasattr(self, 'repl_sub') and self.repl_sub and self.repl_sub in events:
+                        message = self.repl_sub.recv(zmq.NOBLOCK)
+                        self.message_queue.append(message)
+                        self.logger.debug(f"BrokerMW::forward_messages - Received replicated message, added to queue")
+                
+                except zmq.ZMQError as e:
+                    if e.errno == zmq.EAGAIN:
+                        # No message available right now
+                        return False
+                    else:
+                        self.logger.error(f"BrokerMW::forward_messages - ZMQ error: {str(e)}")
+                        return False
             
-            # Handle incoming messages from publishers
-            if self.sub in events:
-                message = self.sub.recv()
+            # If we have messages to process, forward them
+            if self.message_queue:
+                message = self.message_queue.pop(0)
                 
                 # Forward message to subscribers
                 if self.pub:
                     self.pub.send(message)
+                    self.logger.debug(f"BrokerMW::forward_messages - Forwarded message to subscribers")
                 
-                # If primary, replicate to backups
+                # If primary, also replicate to backups
                 if self.is_primary and self.repl_pub:
                     self.repl_pub.send(message)
+                    self.logger.debug(f"BrokerMW::forward_messages - Replicated message to backups")
+                
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"BrokerMW::forward_messages - Exception: {str(e)}")
+            return False
+    
+    def event_loop(self, timeout=None):
+        """Process events for the specified timeout - simplified to focus on collection"""
+        try:
+            # Poll for events, but defer processing to forward_messages
+            events = dict(self.poller.poll(timeout=timeout))
+            
+            # Just collect messages for the queue, don't process them here
+            if self.sub and self.sub in events:
+                try:
+                    message = self.sub.recv()
+                    self.message_queue.append(message)
+                    self.logger.debug(f"BrokerMW::event_loop - Received message, added to queue")
                     
-                # Let application know we processed something
-                if self.upcall_obj:
-                    self.upcall_obj.invoke_operation()
+                    # Let application know we received something
+                    if self.upcall_obj:
+                        self.upcall_obj.invoke_operation()
+                except zmq.ZMQError as e:
+                    self.logger.error(f"BrokerMW::event_loop - ZMQ error on SUB socket: {str(e)}")
             
             # Handle replicated messages from primary (if backup)
             elif hasattr(self, 'repl_sub') and self.repl_sub and self.repl_sub in events:
-                message = self.repl_sub.recv()
-                
-                # Forward replicated message to subscribers
-                if self.pub:
-                    self.pub.send(message)
-                
-                # Let application know we processed something
-                if self.upcall_obj:
-                    self.upcall_obj.invoke_operation()
+                try:
+                    message = self.repl_sub.recv()
+                    self.message_queue.append(message)
+                    self.logger.debug(f"BrokerMW::event_loop - Received replicated message, added to queue")
+                    
+                    # Let application know we received something
+                    if self.upcall_obj:
+                        self.upcall_obj.invoke_operation()
+                except zmq.ZMQError as e:
+                    self.logger.error(f"BrokerMW::event_loop - ZMQ error on replication SUB socket: {str(e)}")
                 
         except Exception as e:
             self.logger.error(f"BrokerMW::event_loop - Exception: {str(e)}")
-            raise e  # Re-raise to allow proper handling in application
+            # Don't re-raise here - just log error and continue
+            return
     
     def set_upcall_handle(self, upcall_obj):
         """Set the upcall object"""
@@ -246,74 +315,103 @@ class BrokerMW:
             else:
                 self.setup_backup_replication()
     
+    def register(self, name, addr_port):
+        """Register the broker with the Discovery service"""
+        try:
+            self.logger.info(f"BrokerMW::register - Registering broker {name} at {addr_port}")
+            
+            # Create the protobuf registration request
+            reg_info = discovery_pb2.RegistrantInfo()
+            reg_info.id = name
+            
+            # Split address and port
+            if ":" in addr_port:
+                addr, port_str = addr_port.split(":")
+                reg_info.addr = addr
+                reg_info.port = int(port_str)
+            
+            # Create registration request
+            register_req = discovery_pb2.RegisterReq()
+            register_req.role = discovery_pb2.ROLE_BOTH  # Broker is both publisher and subscriber
+            register_req.info.CopyFrom(reg_info)
+            
+            # Add to all topics (or specify topics if needed)
+            register_req.topiclist.extend(["*"])  # Wildcard to indicate all topics
+            
+            # Create overall Discovery request
+            disc_req = discovery_pb2.DiscoveryReq()
+            disc_req.msg_type = discovery_pb2.TYPE_REGISTER
+            disc_req.register_req.CopyFrom(register_req)
+            
+            # Send registration request
+            self.req.send(disc_req.SerializeToString())
+            
+            # Wait for response (with timeout)
+            try:
+                response_bytes = self.req.recv(timeout=5000)  # 5-second timeout
+                disc_resp = discovery_pb2.DiscoveryResp()
+                disc_resp.ParseFromString(response_bytes)
+                
+                if disc_resp.register_resp.status == discovery_pb2.STATUS_SUCCESS:
+                    self.logger.info("BrokerMW::register - Successfully registered with Discovery")
+                else:
+                    reason = disc_resp.register_resp.reason
+                    self.logger.warning(f"BrokerMW::register - Registration failed: {reason}")
+                
+            except Exception as e:
+                self.logger.error(f"BrokerMW::register - Error receiving response: {str(e)}")
+        
+        except Exception as e:
+            self.logger.error(f"BrokerMW::register - Exception: {str(e)}")
+            raise e
+    
     def cleanup(self):
         """Clean up all resources"""
         try:
             self.logger.info("BrokerMW::cleanup - Cleaning up resources")
             
             # Close sockets
-            if self.sub:
-                self.poller.unregister(self.sub)
-                self.sub.close()
-                
-            if self.pub:
-                self.pub.close()
-                
+            if hasattr(self, 'sub') and self.sub:
+                try:
+                    self.poller.unregister(self.sub)
+                    self.sub.close()
+                    self.logger.info("BrokerMW::cleanup - Closed SUB socket")
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::cleanup - Error closing SUB socket: {str(e)}")
+            
+            if hasattr(self, 'pub') and self.pub:
+                try:
+                    self.pub.close()
+                    self.logger.info("BrokerMW::cleanup - Closed PUB socket")
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::cleanup - Error closing PUB socket: {str(e)}")
+            
+            # Clean up REQ socket
+            if hasattr(self, 'req') and self.req:
+                self.req.close()
+            
+            # Clean up replication sockets
             if hasattr(self, 'repl_pub') and self.repl_pub:
-                self.repl_pub.close()
-                
+                try:
+                    self.repl_pub.close()
+                    self.logger.info("BrokerMW::cleanup - Closed replication PUB socket")
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::cleanup - Error closing replication PUB socket: {str(e)}")
+                    
             if hasattr(self, 'repl_sub') and self.repl_sub:
-                self.poller.unregister(self.repl_sub)
-                self.repl_sub.close()
-                
-            # Terminate ZMQ context
-            self.context.term()
+                try:
+                    if hasattr(self, 'poller') and self.poller:
+                        self.poller.unregister(self.repl_sub)
+                    self.repl_sub.close()
+                    self.logger.info("BrokerMW::cleanup - Closed replication SUB socket")
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::cleanup - Error closing replication SUB socket: {str(e)}")
             
+            self.logger.info("BrokerMW::cleanup - Cleanup complete")
         except Exception as e:
-            self.logger.error(f"BrokerMW::cleanup - Exception: {str(e)}")
+            self.logger.error(f"BrokerMW::cleanup - Exception during cleanup: {str(e)}")
 
-    def signal_handler(self, signum, frame):
-        self.logger.info(f"BrokerAppln::signal_handler - Received signal {signum}")
-        self.cleanup()
-        sys.exit(0)
-
-    def cleanup(self):
-        """Clean up resources and deregister from ZooKeeper"""
-        try:
-            self.logger.info("BrokerAppln::cleanup - Performing cleanup operations")
-            
-            # Stop the lease renewal thread if it's running
-            self.is_primary = False
-            if self.lease_thread and self.lease_thread.is_alive():
-                self.lease_thread.join(timeout=2)
-                
-            # Explicitly delete our leader node if we're the primary
-            if self.zk and self.zk.connected and self.leader_path:
-                if self.zk.exists(self.leader_path):
-                    try:
-                        data, _ = self.zk.get(self.leader_path)
-                        our_addr = f"{self.args.addr}:{self.args.port}"
-                        
-                        # Only delete if it's our node
-                        if data and our_addr in data.decode():
-                            self.logger.info("BrokerAppln::cleanup - Deleting our leader node from ZooKeeper")
-                            self.zk.delete(self.leader_path)
-                    except Exception as e:
-                        self.logger.warning(f"BrokerAppln::cleanup - Error deleting leader node: {e}")
-            
-            # Close the ZooKeeper connection
-            if self.zk:
-                self.logger.info("BrokerAppln::cleanup - Closing ZooKeeper connection")
-                self.zk.stop()
-                self.zk.close()
-                
-            # Close middleware resources
-            if self.mw_obj and hasattr(self.mw_obj, 'cleanup'):
-                self.mw_obj.cleanup()
-                
-            self.logger.info("BrokerAppln::cleanup - Cleanup complete")
-            
-        except Exception as e:
-            self.logger.error(f"BrokerAppln::cleanup - Error during cleanup: {e}")
+    # Note: Removed duplicated cleanup() method and misplaced signal_handler() method
+    # that were accidentally copied from BrokerAppln class
 
 

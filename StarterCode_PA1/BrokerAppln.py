@@ -20,7 +20,9 @@ import socket
 import subprocess
 from kazoo.client import KazooClient
 from kazoo.exceptions import NodeExistsError
+from kazoo.recipe.lock import Lock  # Import the same Lock recipe used in Discovery
 from CS6381_MW.BrokerMW import BrokerMW
+from CS6381_MW import discovery_pb2
 
 # Helper function for getting new port for quorum spawning
 def get_free_port():
@@ -38,8 +40,8 @@ class BrokerAppln():
         self.zk = None
         self.name = None
         self.is_primary = False
-        self.leader_path = "/broker/leader"
-        self.replicas_path = "/broker/replicas"
+        self.leader_path = "/brokers/leader"      # Changed from /broker/leader
+        self.replicas_path = "/brokers/replicas"  # Changed from /broker/replicas
         
         # Lease settings
         self.lease_duration = 30
@@ -69,7 +71,7 @@ class BrokerAppln():
             self.logger.info("BrokerAppln::configure - Connected to ZooKeeper")
             
             # Ensure base paths exist
-            self.zk.ensure_path("/broker")
+            self.zk.ensure_path("/brokers")
             self.zk.ensure_path(self.replicas_path)
             
             # Register this instance as a replica
@@ -113,7 +115,7 @@ class BrokerAppln():
                         self.logger.info("BrokerAppln::watch_leader - Leader znode deleted. Attempting to become primary...")
                         time.sleep(1)  # Small delay to avoid race conditions
                         try:
-                            self.zk.ensure_path("/broker")
+                            self.zk.ensure_path("/brokers")  # Changed from /broker
                             if not self.zk.exists(self.leader_path):
                                 new_expiry = time.time() + self.lease_duration
                                 new_data = f"{broker_address}|{new_expiry}"
@@ -137,6 +139,9 @@ class BrokerAppln():
             self.mw_obj = BrokerMW(self.logger)
             self.mw_obj.configure(args, self.is_primary, self.zk)
             self.mw_obj.set_upcall_handle(self)
+            
+            # Register with Discovery service
+            self.register_with_discovery()
             
             self.logger.info("BrokerAppln::configure - Configuration complete")
             self.dump_zk_nodes()
@@ -164,8 +169,8 @@ class BrokerAppln():
         """Attempt to spawn a new Broker replica using a global lock to ensure only one spawns."""
         self.logger.info("BrokerAppln::spawn_replica - Attempting to spawn a new Broker replica to restore quorum.")
         
-        # Use a global lock in ZooKeeper to coordinate spawns.
-        spawn_lock = self.zk.Lock("/broker/spawn_lock")
+        # Use the same Lock recipe as Discovery to ensure compatibility
+        spawn_lock = Lock(self.zk, "/brokers/spawn_lock")
         try:
             # Acquire the lock with a timeout (say, 5 seconds)
             if spawn_lock.acquire(timeout=5):
@@ -232,9 +237,43 @@ class BrokerAppln():
     
     def invoke_operation(self):
         """Invoked by the middleware when a message is processed"""
-        # This method can be empty or contain minimal logging
-        # since we're just using it as a callback notification
-        pass
+        try:
+            # Check for and forward any available messages (non-blocking)
+            result = self.mw_obj.forward_messages()
+            if result:
+                self.logger.debug("BrokerAppln::invoke_operation - message forwarded successfully")
+            return None
+        except Exception as e:
+            self.logger.error(f"BrokerAppln::invoke_operation - error: {str(e)}")
+            return None
+    
+    def driver(self):
+        """Main driver for the broker application"""
+        try:
+            self.logger.info("BrokerAppln::driver - starting event loop")
+            self.mw_obj.set_upcall_handle(self)
+            
+            # Register cleanup handlers
+            atexit.register(self.cleanup)
+            
+            # Main event loop
+            while True:
+                # Process any network events (with timeout)
+                self.mw_obj.event_loop(timeout=100)  # 100ms timeout
+                
+                # Explicitly check for messages to forward (non-blocking)
+                self.invoke_operation()
+                
+                # Small sleep to prevent CPU spinning
+                time.sleep(0.01)
+                
+        except KeyboardInterrupt:
+            self.logger.info("KeyboardInterrupt received, shutting down")
+        except Exception as e:
+            self.logger.error(f"BrokerAppln::driver - error: {str(e)}")
+        finally:
+            # Ensure cleanup happens
+            self.cleanup()
     
     def signal_handler(self, signum, frame):
         self.logger.info(f"BrokerAppln::signal_handler - Received signal {signum}")
@@ -246,39 +285,48 @@ class BrokerAppln():
         try:
             self.logger.info("BrokerAppln::cleanup - Performing cleanup operations")
             
-            # Stop the lease renewal thread if it's running
-            self.is_primary = False
-            if self.lease_thread and self.lease_thread.is_alive():
-                self.lease_thread.join(timeout=2)
-                
-            # Explicitly delete our leader node if we're the primary
-            if self.zk and self.zk.connected and self.leader_path:
-                if self.zk.exists(self.leader_path):
-                    try:
+            # If we have a lease thread, stop it
+            if hasattr(self, 'lease_thread') and self.lease_thread and self.lease_thread.is_alive():
+                try:
+                    # Set a flag to stop the thread
+                    self.is_primary = False  # This should cause the thread to exit
+                    self.lease_thread.join(timeout=2)  # Wait up to 2 seconds for thread to exit
+                    self.logger.info("BrokerAppln::cleanup - Lease thread stopped")
+                except Exception as e:
+                    self.logger.error(f"BrokerAppln::cleanup - Error stopping lease thread: {str(e)}")
+            
+            # Clean up ZooKeeper nodes if we're the leader
+            if self.is_primary and self.zk and self.zk.connected:
+                try:
+                    # Delete leader znode if it exists and we're the owner
+                    if self.zk.exists(self.leader_path):
                         data, _ = self.zk.get(self.leader_path)
-                        our_addr = f"{self.args.addr}:{self.args.port}"
-                        
-                        # Only delete if it's our node
-                        if data and our_addr in data.decode():
-                            self.logger.info("BrokerAppln::cleanup - Deleting our leader node from ZooKeeper")
+                        if data and data.decode().startswith(f"{self.args.addr}:{self.args.port}"):
                             self.zk.delete(self.leader_path)
-                    except Exception as e:
-                        self.logger.warning(f"BrokerAppln::cleanup - Error deleting leader node: {e}")
+                            self.logger.info("BrokerAppln::cleanup - Deleted leader znode")
+                except Exception as e:
+                    self.logger.error(f"BrokerAppln::cleanup - Error cleaning up ZooKeeper nodes: {str(e)}")
             
-            # Close the ZooKeeper connection
-            if self.zk:
-                self.logger.info("BrokerAppln::cleanup - Closing ZooKeeper connection")
-                self.zk.stop()
-                self.zk.close()
-                
-            # Close middleware resources
-            if self.mw_obj and hasattr(self.mw_obj, 'cleanup'):
-                self.mw_obj.cleanup()
-                
+            # Clean up middleware
+            if hasattr(self, 'mw_obj') and self.mw_obj:
+                try:
+                    self.mw_obj.cleanup()
+                    self.logger.info("BrokerAppln::cleanup - Middleware cleaned up")
+                except Exception as e:
+                    self.logger.error(f"BrokerAppln::cleanup - Error cleaning up middleware: {str(e)}")
+            
+            # Close ZooKeeper connection
+            if hasattr(self, 'zk') and self.zk:
+                try:
+                    self.logger.info("BrokerAppln::cleanup - Closing ZooKeeper connection")
+                    self.zk.stop()
+                    self.zk.close()
+                except Exception as e:
+                    self.logger.error(f"BrokerAppln::cleanup - Error closing ZooKeeper connection: {str(e)}")
+            
             self.logger.info("BrokerAppln::cleanup - Cleanup complete")
-            
         except Exception as e:
-            self.logger.error(f"BrokerAppln::cleanup - Error during cleanup: {e}")
+            self.logger.error(f"BrokerAppln::cleanup - Error during cleanup: {str(e)}")
     
     def dump_zk_nodes(self):
         """Debug method to dump ZooKeeper node structure"""
@@ -311,23 +359,19 @@ class BrokerAppln():
             self.logger.error(f"Error checking quorum: {str(e)}")
             return False
 
-    def run(self):
-        """ Run Broker Service Event Loop """
-        self.logger.info("BrokerAppln::run - entering event loop")
+    def register_with_discovery(self):
+        """Register the broker with the Discovery service"""
         try:
-            # Register cleanup handlers
-            atexit.register(self.cleanup)
-            # Run the event loop
-            while True:
-                self.mw_obj.event_loop(timeout=100)  # 100ms timeout
-                time.sleep(0.01)  # Small sleep to prevent CPU spinning
-        except KeyboardInterrupt:
-            self.logger.info("KeyboardInterrupt received, shutting down")
+            self.logger.info("BrokerAppln::register_with_discovery - Registering with Discovery service")
+            
+            # Create Discovery registration request
+            broker_address = f"{self.args.addr}:{self.args.port}"
+            self.mw_obj.register(self.name, broker_address)
+            
+            self.logger.info("BrokerAppln::register_with_discovery - Registration request sent to Discovery")
         except Exception as e:
-            self.logger.error(f"Exception in event loop: {e}")
-        finally:
-            # Ensure cleanup happens
-            self.cleanup()
+            self.logger.error(f"BrokerAppln::register_with_discovery - Error: {str(e)}")
+            raise e
 
 def parseCmdLineArgs():
     parser = argparse.ArgumentParser(description="Broker Application")
@@ -348,7 +392,7 @@ def main():
     
     try:
         app.configure(args)
-        app.run()
+        app.driver()  # This will now call driver()
     except Exception as e:
         logger.error(f"Exception in main: {e}")
         if hasattr(app, 'cleanup'):
