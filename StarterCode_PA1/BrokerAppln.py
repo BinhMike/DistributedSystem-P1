@@ -88,37 +88,87 @@ class BrokerAppln():
         """Attempt to spawn a new broker replica using a global lock to ensure only one spawns."""
         self.logger.info("Attempting to spawn a new Broker replica to restore quorum.")
         
-        # Use a global lock in ZooKeeper to coordinate spawns.
-        spawn_lock = Lock(self.zk, "/brokers/spawn_lock")
-        try:
-            # Acquire the lock with a timeout (say, 5 seconds)
-            if spawn_lock.acquire(timeout=5):
-                # Once the lock is acquired, re-check the replica count.
-                replicas = self.zk.get_children(self.replicas_path)
-                if len(replicas) >= 3:
-                    self.logger.info("Quorum restored while waiting for lock; no need to spawn.")
-                    spawn_lock.release()
-                    return
+        # Check if there's a stale lock before trying to acquire
+        spawn_lock_path = "/brokers/spawn_lock"
+        
+        # First check if the lock node exists
+        if self.zk.exists(f"{spawn_lock_path}/lock"):
+            try:
+                # Get lock data and creation time
+                data, stat = self.zk.get(f"{spawn_lock_path}/lock")
+                lock_age = time.time() - (stat.ctime / 1000)  # ZK time is in milliseconds
                 
-                free_port = get_free_port()
-                self.logger.info("Spawn lock acquired; proceeding to spawn new replica.")
-                # Construct the command using stored args
-                cmd = [
-                    "gnome-terminal",
-                    "--", "bash", "-c",
-                    f"python3 {sys.argv[0]} -p {free_port} -a {self.args.addr} -z {self.args.zookeeper} -c {self.args.config} -l {self.args.loglevel}; exec bash"
-                ]
-                try:
-                    subprocess.Popen(cmd)
-                    self.logger.info(f"Spawned new Broker replica with command: {' '.join(cmd)}")
-                except Exception as e:
-                    self.logger.error(f"Failed to spawn a new replica: {str(e)}")
-                finally:
-                    spawn_lock.release()
-            else:
-                self.logger.info("Could not acquire spawn lock; another replica may be spawning.")
-        except Exception as e:
-            self.logger.error(f"Error acquiring spawn lock: {str(e)}")
+                # If lock is older than 60 seconds, consider it stale
+                if lock_age > 60:
+                    self.logger.warning(f"Detected stale lock (age: {lock_age:.1f}s). Attempting to clean up.")
+                    try:
+                        self.zk.delete(f"{spawn_lock_path}/lock")
+                        self.logger.info("Successfully cleaned up stale lock node.")
+                        # Give ZK a moment to fully process the deletion
+                        time.sleep(1)
+                    except Exception as e:
+                        self.logger.error(f"Failed to clean up stale lock: {str(e)}")
+            except Exception as e:
+                self.logger.error(f"Error checking lock age: {str(e)}")
+        
+        # Now try to acquire the lock with a retry mechanism
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                spawn_lock = Lock(self.zk, spawn_lock_path)
+                
+                # Use a shorter timeout initially, then longer
+                timeout = 5 if attempt == 0 else 10
+                
+                self.logger.info(f"Attempting to acquire spawn lock (attempt {attempt+1}/{max_retries}, timeout: {timeout}s)")
+                if spawn_lock.acquire(timeout=timeout):
+                    try:
+                        # Re-check quorum status with lock held
+                        replicas = self.zk.get_children(self.replicas_path)
+                        if len(replicas) >= 3:
+                            self.logger.info("Quorum restored while waiting for lock; no need to spawn.")
+                            return
+                        
+                        # Get free port for new replica
+                        free_port = get_free_port()
+                        self.logger.info(f"Spawning new replica on port {free_port}")
+                        
+                        # Build command, carefully handling optional arguments
+                        cmd = ["gnome-terminal", "--", "bash", "-c"]
+                        spawn_cmd = f"python3 {sys.argv[0]} -p {free_port} -a {self.args.addr} -z {self.args.zookeeper} -n broker_replica_{free_port} -l {self.args.loglevel}"
+                        
+                        # Add config flag only if it was provided
+                        if hasattr(self.args, 'config') and self.args.config:
+                            spawn_cmd += f" -c {self.args.config}"
+                        
+                        spawn_cmd += "; exec bash"
+                        cmd.append(spawn_cmd)
+                        
+                        # Launch the new broker process
+                        subprocess.Popen(cmd)
+                        self.logger.info(f"Spawned new Broker replica with command: {spawn_cmd}")
+                        return  # Successfully spawned
+                    except Exception as e:
+                        self.logger.error(f"Error while spawn lock was held: {str(e)}")
+                    finally:
+                        # Always release the lock
+                        try:
+                            spawn_lock.release()
+                            self.logger.info("Spawn lock released successfully")
+                        except Exception as e:
+                            self.logger.error(f"Error releasing spawn lock: {str(e)}")
+                else:
+                    self.logger.warning(f"Could not acquire spawn lock on attempt {attempt+1}")
+            except Exception as e:
+                self.logger.error(f"Exception during lock handling on attempt {attempt+1}: {str(e)}")
+            
+            # Wait before retrying
+            if attempt < max_retries - 1:
+                backoff = 3 * (attempt + 1)
+                self.logger.info(f"Waiting {backoff}s before retry...")
+                time.sleep(backoff)
+        
+        self.logger.error("Failed to spawn a new replica after multiple attempts")
 
 
     ########################################
@@ -156,7 +206,7 @@ class BrokerAppln():
                         if self.zk.exists(self.leader_path):
                             self.zk.delete(self.leader_path)
                             self.logger.info("Deleted leader znode to relinquish leadership.")
-                            time.sleep(1)
+                            time.sleep(5)
                     except Exception as e:
                         self.logger.error(f"Error deleting leader znode: {str(e)}")
                     self.is_primary = False
@@ -262,6 +312,9 @@ class BrokerAppln():
             self.logger.debug("BrokerAppln::configure - Initializing middleware")
             self.mw_obj = BrokerMW(self.logger, self.zk, False)  
             self.mw_obj.configure(args)
+            
+            # Register with discovery service
+            self.mw_obj.register(self.name)
             
             self.logger.info("BrokerAppln::configure - completed")
         except Exception as e:

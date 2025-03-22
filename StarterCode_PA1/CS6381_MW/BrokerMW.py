@@ -71,6 +71,12 @@ class BrokerMW():
             self.publisher_path = "/publishers"
             self.subscribe_to_publishers()
             
+            # Set up watch for publisher changes
+            @self.zk.ChildrenWatch(self.publisher_path)
+            def watch_publishers(children):
+                self.logger.info(f"BrokerMW::configure - Publisher list changed: {children}")
+                self.handle_publisher_change(children)
+            
             # Initialize replication sockets if needed
             if self.is_primary:
                 # Primary broker's replication socket (PUB for followers)
@@ -143,17 +149,22 @@ class BrokerMW():
                     except Exception as e:
                         self.logger.error(f"BrokerMW::handle_publisher_change - Error connecting to publisher {pub_id}: {str(e)}")
             
-            # Update the poller to use the new socket
+            # Hold a reference to the old socket
+            old_sub = self.sub
+            
+            # Make the new socket the current one BEFORE updating the poller
+            self.sub = new_sub
+            
+            # Register the new socket with the poller
+            self.poller.register(new_sub, zmq.POLLIN)
+            
+            # Now safely unregister and close the old socket
             try:
-                if self.sub:
-                    self.poller.unregister(self.sub)
-                    self.sub.close()
+                if old_sub:
+                    self.poller.unregister(old_sub)
+                    old_sub.close()
             except Exception as e:
                 self.logger.error(f"BrokerMW::handle_publisher_change - Error unregistering old socket: {str(e)}")
-                
-            # Assign new socket and register with poller
-            self.sub = new_sub
-            self.poller.register(self.sub, zmq.POLLIN)
             
         except Exception as e:
             self.logger.error(f"BrokerMW::handle_publisher_change - Error: {str(e)}")
@@ -197,18 +208,42 @@ class BrokerMW():
         self.is_primary = is_primary
         
         # If becoming primary, initialize replication socket if it doesn't exist
-        if is_primary and not hasattr(self, 'replication_socket'):
-            self.replication_socket = self.context.socket(zmq.PUB)
-            repl_port = self.port + 1000
-            self.replication_socket.bind(f"tcp://*:{repl_port}")
-            self.logger.info(f"BrokerMW::update_primary_status - Bound replication socket to port {repl_port}")
+        if is_primary:
+            if not hasattr(self, 'replication_socket'):
+                self.replication_socket = self.context.socket(zmq.PUB)
+                repl_port = self.port + 1000
+                self.replication_socket.bind(f"tcp://*:{repl_port}")
+                self.logger.info(f"BrokerMW::update_primary_status - Bound replication socket to port {repl_port}")
+            
+            # Register as a publisher
+            if self.args and hasattr(self.args, 'name'):
+                broker_as_pub_node = f"{self.publisher_path}/{self.args.name}"
+                address_str = f"{self.addr}:{self.port}"
+                
+                if not self.zk.exists(self.publisher_path):
+                    self.zk.create(self.publisher_path, b"", makepath=True)
+                    
+                if self.zk.exists(broker_as_pub_node):
+                    self.zk.set(broker_as_pub_node, address_str.encode())
+                else:
+                    self.zk.create(broker_as_pub_node, address_str.encode())
+                
+                self.logger.info(f"BrokerMW::update_primary_status - Registered as publisher: {broker_as_pub_node}")
         
         # If becoming follower, make sure we have a replication listener
-        elif not is_primary and not hasattr(self, 'replication_listener'):
-            self.replication_listener = self.context.socket(zmq.SUB)
-            self.replication_listener.setsockopt_string(zmq.SUBSCRIBE, "")
-            self.poller.register(self.replication_listener, zmq.POLLIN)
-            self.logger.info("BrokerMW::update_primary_status - Created replication listener")
+        else:
+            if not hasattr(self, 'replication_listener'):
+                self.replication_listener = self.context.socket(zmq.SUB)
+                self.replication_listener.setsockopt_string(zmq.SUBSCRIBE, "")
+                self.poller.register(self.replication_listener, zmq.POLLIN)
+                self.logger.info("BrokerMW::update_primary_status - Created replication listener")
+            
+            # Remove publisher registration if we have one
+            if self.args and hasattr(self.args, 'name'):
+                broker_as_pub_node = f"{self.publisher_path}/{self.args.name}"
+                if self.zk.exists(broker_as_pub_node):
+                    self.zk.delete(broker_as_pub_node)
+                    self.logger.info(f"BrokerMW::update_primary_status - Removed publisher registration: {broker_as_pub_node}")
 
     ########################################
     # Event Loop
@@ -225,21 +260,23 @@ class BrokerMW():
             
             # Handle messages from publishers
             if self.sub and self.sub in events:
-                # Receive the message
-                topic_and_message = self.sub.recv_string()
-                topic, message = topic_and_message.split(":", 1)
+                # Receive the message - preserving the full original format
+                message = self.sub.recv_string()
+                parts = message.split(":", 1)
+                topic = parts[0]
                 
-                self.logger.info(f"BrokerMW::event_loop - Received topic [{topic}] with message [{message}]")
+                self.logger.info(f"BrokerMW::event_loop - Received message on topic [{topic}]")
                 
                 # Primary broker forwards to subscribers directly and replicates
                 if self.is_primary and self.pub:
-                    self.pub.send_string(topic_and_message)
+                    # Forward the complete original message
+                    self.pub.send_string(message)
                     self.logger.info(f"BrokerMW::event_loop - Primary forwarded message on topic [{topic}]")
                     
                     # Replicate to follower brokers
                     if hasattr(self, 'replication_socket') and self.replication_socket:
                         try:
-                            self.replication_socket.send_string(topic_and_message)
+                            self.replication_socket.send_string(message)
                             self.logger.debug(f"BrokerMW::event_loop - Replicated message to followers")
                         except Exception as e:
                             self.logger.error(f"BrokerMW::event_loop - Failed to replicate message: {str(e)}")
@@ -250,14 +287,16 @@ class BrokerMW():
             
             # Handle replication messages (if follower)
             elif hasattr(self, 'replication_listener') and self.replication_listener in events:
-                replica_message = self.replication_listener.recv_string()
-                topic, message = replica_message.split(":", 1)
+                # Preserve the full message format
+                message = self.replication_listener.recv_string()
+                parts = message.split(":", 1)
+                topic = parts[0]
                 
-                self.logger.info(f"BrokerMW::event_loop - Follower received replicated topic [{topic}] with message [{message}]")
+                self.logger.info(f"BrokerMW::event_loop - Follower received replicated message on topic [{topic}]")
                 
-                # Forward replicated message to subscribers
+                # Forward replicated message to subscribers (preserving format)
                 if self.pub:
-                    self.pub.send_string(replica_message)
+                    self.pub.send_string(message)
                 
                 # Let application know we processed something
                 if self.upcall_obj:
@@ -307,3 +346,52 @@ class BrokerMW():
             
         except Exception as e:
             self.logger.error(f"BrokerMW::cleanup - Error: {str(e)}")
+
+    ########################################
+    # Register with Discovery Service
+    ########################################
+    def register(self, name, topic_list=None):
+        """Register the broker with the discovery service via ZooKeeper"""
+        try:
+            self.logger.info(f"BrokerMW::register - Registering broker {name}")
+            
+            # Create broker node if it doesn't exist
+            broker_path = "/brokers"
+            if not self.zk.exists(broker_path):
+                self.zk.create(broker_path, b"", makepath=True)
+                
+            # Register this broker with its address information
+            broker_node = f"{broker_path}/{name}"
+            address_str = f"{self.addr}:{self.port}"
+            
+            if self.zk.exists(broker_node):
+                self.zk.set(broker_node, address_str.encode())
+                self.logger.info(f"BrokerMW::register - Updated broker node: {broker_node} with {address_str}")
+            else:
+                self.zk.create(broker_node, address_str.encode())
+                self.logger.info(f"BrokerMW::register - Created broker node: {broker_node} with {address_str}")
+                
+            # Only register as a "publisher" if we are the primary broker
+            if self.is_primary:
+                if not self.zk.exists(self.publisher_path):
+                    self.zk.create(self.publisher_path, b"", makepath=True)
+                    
+                broker_as_pub_node = f"{self.publisher_path}/{name}"
+                if self.zk.exists(broker_as_pub_node):
+                    self.zk.set(broker_as_pub_node, address_str.encode())
+                    self.logger.info(f"BrokerMW::register - Updated broker as publisher: {broker_as_pub_node}")
+                else:
+                    self.zk.create(broker_as_pub_node, address_str.encode())
+                    self.logger.info(f"BrokerMW::register - Created broker as publisher: {broker_as_pub_node}")
+            else:
+                # If we're not primary, make sure we're not registered as a publisher
+                broker_as_pub_node = f"{self.publisher_path}/{name}"
+                if self.zk.exists(broker_as_pub_node):
+                    self.zk.delete(broker_as_pub_node)
+                    self.logger.info(f"BrokerMW::register - Removed non-primary broker from publishers: {broker_as_pub_node}")
+                    
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"BrokerMW::register - Error: {str(e)}")
+            return False
