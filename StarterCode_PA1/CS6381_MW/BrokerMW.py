@@ -152,19 +152,25 @@ class BrokerMW():
             # Hold a reference to the old socket
             old_sub = self.sub
             
-            # Make the new socket the current one BEFORE updating the poller
-            self.sub = new_sub
+            # Now safely unregister the old socket BEFORE updating the reference
+            try:
+                if old_sub:
+                    self.poller.unregister(old_sub)
+            except Exception as e:
+                self.logger.error(f"BrokerMW::handle_publisher_change - Error unregistering old socket: {str(e)}")
             
             # Register the new socket with the poller
             self.poller.register(new_sub, zmq.POLLIN)
             
-            # Now safely unregister and close the old socket
+            # Make the new socket the current one AFTER updating the poller
+            self.sub = new_sub
+            
+            # Now close the old socket
             try:
                 if old_sub:
-                    self.poller.unregister(old_sub)
                     old_sub.close()
             except Exception as e:
-                self.logger.error(f"BrokerMW::handle_publisher_change - Error unregistering old socket: {str(e)}")
+                self.logger.error(f"BrokerMW::handle_publisher_change - Error closing old socket: {str(e)}")
             
         except Exception as e:
             self.logger.error(f"BrokerMW::handle_publisher_change - Error: {str(e)}")
@@ -205,45 +211,72 @@ class BrokerMW():
             return  # No change in status
             
         self.logger.info(f"BrokerMW::update_primary_status - Changing primary status to: {is_primary}")
-        self.is_primary = is_primary
         
-        # If becoming primary, initialize replication socket if it doesn't exist
+        # Safely handle socket transitions before changing status
         if is_primary:
+            # If becoming primary, initialize replication socket if it doesn't exist
             if not hasattr(self, 'replication_socket'):
                 self.replication_socket = self.context.socket(zmq.PUB)
                 repl_port = self.port + 1000
                 self.replication_socket.bind(f"tcp://*:{repl_port}")
                 self.logger.info(f"BrokerMW::update_primary_status - Bound replication socket to port {repl_port}")
             
-            # Register as a publisher
-            if self.args and hasattr(self.args, 'name'):
-                broker_as_pub_node = f"{self.publisher_path}/{self.args.name}"
-                address_str = f"{self.addr}:{self.port}"
-                
-                if not self.zk.exists(self.publisher_path):
-                    self.zk.create(self.publisher_path, b"", makepath=True)
-                    
-                if self.zk.exists(broker_as_pub_node):
-                    self.zk.set(broker_as_pub_node, address_str.encode())
-                else:
-                    self.zk.create(broker_as_pub_node, address_str.encode())
-                
-                self.logger.info(f"BrokerMW::update_primary_status - Registered as publisher: {broker_as_pub_node}")
-        
-        # If becoming follower, make sure we have a replication listener
+            # If we have a replication listener, unregister it from the poller before closing
+            if hasattr(self, 'replication_listener') and self.replication_listener:
+                try:
+                    self.poller.unregister(self.replication_listener)
+                    self.replication_listener.close()
+                    del self.replication_listener
+                    self.logger.info("BrokerMW::update_primary_status - Closed replication listener")
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::update_primary_status - Error closing replication listener: {str(e)}")
         else:
-            if not hasattr(self, 'replication_listener'):
+            # If becoming follower, create replication listener if needed
+            if not hasattr(self, 'replication_listener') or not self.replication_listener:
                 self.replication_listener = self.context.socket(zmq.SUB)
                 self.replication_listener.setsockopt_string(zmq.SUBSCRIBE, "")
                 self.poller.register(self.replication_listener, zmq.POLLIN)
                 self.logger.info("BrokerMW::update_primary_status - Created replication listener")
             
-            # Remove publisher registration if we have one
-            if self.args and hasattr(self.args, 'name'):
-                broker_as_pub_node = f"{self.publisher_path}/{self.args.name}"
-                if self.zk.exists(broker_as_pub_node):
-                    self.zk.delete(broker_as_pub_node)
-                    self.logger.info(f"BrokerMW::update_primary_status - Removed publisher registration: {broker_as_pub_node}")
+            # Close replication socket if we have one
+            if hasattr(self, 'replication_socket') and self.replication_socket:
+                try:
+                    self.replication_socket.close()
+                    del self.replication_socket
+                    self.logger.info("BrokerMW::update_primary_status - Closed replication socket")
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::update_primary_status - Error closing replication socket: {str(e)}")
+        
+        # Now update our status
+        self.is_primary = is_primary
+        
+        # Handle ZooKeeper registration based on new status
+        if self.args and hasattr(self.args, 'name'):
+            broker_as_pub_node = f"{self.publisher_path}/{self.args.name}"
+            
+            if is_primary:
+                # Register as a publisher if primary
+                address_str = f"{self.addr}:{self.port}"
+                
+                if not self.zk.exists(self.publisher_path):
+                    self.zk.create(self.publisher_path, b"", makepath=True)
+                    
+                try:
+                    if self.zk.exists(broker_as_pub_node):
+                        self.zk.set(broker_as_pub_node, address_str.encode())
+                    else:
+                        self.zk.create(broker_as_pub_node, address_str.encode())
+                    self.logger.info(f"BrokerMW::update_primary_status - Registered as publisher: {broker_as_pub_node}")
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::update_primary_status - Error registering as publisher: {str(e)}")
+            else:
+                # Remove publisher registration if not primary
+                try:
+                    if self.zk.exists(broker_as_pub_node):
+                        self.zk.delete(broker_as_pub_node)
+                        self.logger.info(f"BrokerMW::update_primary_status - Removed publisher registration: {broker_as_pub_node}")
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::update_primary_status - Error removing publisher registration: {str(e)}")
 
     ########################################
     # Event Loop
@@ -251,6 +284,12 @@ class BrokerMW():
     def event_loop(self, timeout=None):
         """Process events for specified timeout then return control to application"""
         try:
+            # Make sure we have valid sockets to poll
+            if not self.sub:
+                # No valid subscription socket yet
+                time.sleep(0.01)  # Short sleep to prevent CPU spinning
+                return
+                
             # Poll for events with the specified timeout
             events = dict(self.poller.poll(timeout=timeout))
             

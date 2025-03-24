@@ -232,8 +232,6 @@ class BrokerAppln():
         try:
             self.name = args.name 
             self.args = args
-            # config_obj = configparser.ConfigParser()
-            # config_obj.read(args.config)
 
             # Connect to ZooKeeper
             self.logger.info(f"BrokerAppln::configure - Connecting to ZooKeeper at {args.zookeeper}")
@@ -241,11 +239,16 @@ class BrokerAppln():
             self.zk.start()
             self.logger.info("BrokerAppln::configure - Connected to ZooKeeper")
 
-            # Ensure base paths exist
+            # Initialize middleware FIRST
+            self.logger.debug("BrokerAppln::configure - Initializing middleware")
+            self.mw_obj = BrokerMW(self.logger, self.zk, False)  
+            self.mw_obj.configure(args)
+            
+            # Now we can proceed with ZooKeeper setup for replica tracking
             self.zk.ensure_path(self.zk_path)
             self.zk.ensure_path(self.replicas_path)
             
-            # register this instance as a replica
+            # Register this instance as a replica
             broker_address = f"{args.addr}:{args.port}"
             replica_node = f"{self.replicas_path}/{broker_address}"
             try:
@@ -263,8 +266,10 @@ class BrokerAppln():
                 if self.bootstrap_complete and num < 3:
                     self.logger.info("Quorum not met: fewer than 3 replicas active.")
                     self.spawn_replica()
+            
             self.wait_for_bootstrap()
 
+            # Now handle leadership election after middleware is initialized
             lease_expiry = time.time() + self.lease_duration
             leader_data = f"{broker_address}|{lease_expiry}"
             try:
@@ -272,7 +277,10 @@ class BrokerAppln():
                 self.is_primary = True
                 self.leader_start_time = time.time()  # Record when we became leader
                 self.logger.info(f"Instance {broker_address} became primary with lease expiring at {lease_expiry}.")
-                self.start_lease_renewal(broker_address)   
+                self.start_lease_renewal(broker_address)
+                # Now safe to call update_primary_status since middleware is initialized
+                self.mw_obj.update_primary_status(True)
+                
             except NodeExistsError:
                 self.is_primary = False
                 self.logger.info("A leader already exists. Running as backup.")
@@ -288,12 +296,16 @@ class BrokerAppln():
                                 new_data = f"{broker_address}|{new_expiry}"
                                 self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
                                 self.is_primary = True
-                                self.leader_start_time = time.time()  # Reset the leader start time
+                                self.leader_start_time = time.time()
                                 self.logger.info(f"This instance has now become the primary with lease expiring at {new_expiry}!")
                                 self.start_lease_renewal(broker_address)
+                                self.mw_obj.update_primary_status(True)
+                                
                             else:
                                 self.logger.info("Leader node already recreated by another instance.")
                                 self.is_primary = False
+                                self.mw_obj.update_primary_status(False)
+                            
                         except NodeExistsError:
                             self.logger.info("Another instance became primary while we were trying.")
                             self.is_primary = False
@@ -307,11 +319,6 @@ class BrokerAppln():
                 self.logger.info(f"Current leader in ZooKeeper: {data.decode()}")
             else:
                 self.logger.error("Leader node does not exist after attempted creation.")
-
-            # Initialize middleware - don't register ourselves in ZK here since the middleware will do it
-            self.logger.debug("BrokerAppln::configure - Initializing middleware")
-            self.mw_obj = BrokerMW(self.logger, self.zk, False)  
-            self.mw_obj.configure(args)
             
             # Register with discovery service
             self.mw_obj.register(self.name)
