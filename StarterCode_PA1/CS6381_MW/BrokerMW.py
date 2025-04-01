@@ -304,6 +304,22 @@ class BrokerMW():
         parts = message.split(":", 1)
         topic = parts[0]
         
+        # Add a message identifier to track duplicates
+        message_id = hash(message + str(time.time()))
+        
+        # Check if we've recently seen this message (implement a deduplication cache)
+        if hasattr(self, 'recent_messages') and message in self.recent_messages:
+            self.logger.debug(f"BrokerMW::_handle_publisher_message - Ignoring duplicate message on topic [{topic}]")
+            return
+        
+        # Store message in recent cache
+        if not hasattr(self, 'recent_messages'):
+            self.recent_messages = set()
+        self.recent_messages.add(message)
+        # Limit cache size to prevent memory issues
+        if len(self.recent_messages) > 1000:
+            self.recent_messages.pop()
+            
         self.logger.info(f"BrokerMW::_handle_publisher_message - Received message on topic [{topic}]")
         
         # Primary broker forwards to subscribers directly and replicates
@@ -315,8 +331,11 @@ class BrokerMW():
             # Replicate to follower brokers
             self._replicate_message(message)
         
-        # Let application know we processed something
-        self._notify_application()
+        # Let application know we processed something, but avoid tight loop
+        # Only notify application occasionally to prevent rapid re-polling
+        if not hasattr(self, '_last_notify_time') or time.time() - self._last_notify_time > 0.1:
+            self._notify_application()
+            self._last_notify_time = time.time()
 
     def _handle_replication_message(self):
         """Handle messages from primary broker (replication)"""
