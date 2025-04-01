@@ -415,6 +415,12 @@ class BrokerMW():
                 self.context.term()
                 self.context = None
             
+            # Add explicit ZooKeeper cleanup
+            if hasattr(self, 'zk') and self.zk:
+                self.logger.info("BrokerMW::cleanup - Closing ZooKeeper connection")
+                self.zk.stop()
+                self.zk.close()
+            
             self.logger.info("BrokerMW::cleanup - Cleanup complete")
             
         except Exception as e:
