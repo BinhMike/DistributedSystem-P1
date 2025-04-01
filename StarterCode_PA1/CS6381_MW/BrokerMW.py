@@ -24,6 +24,7 @@ import zmq
 import logging
 import time
 import traceback
+import threading
 from CS6381_MW import discovery_pb2  
 
 class BrokerMW():
@@ -42,6 +43,7 @@ class BrokerMW():
         self.addr = None
         self.port = None
         self.is_primary = is_primary  # Flag indicating if this is the primary broker
+        self.socket_lock = threading.Lock()  # Lock for thread-safe socket operations
         
     ########################################
     # Configure Middleware
@@ -166,18 +168,20 @@ class BrokerMW():
             # Hold a reference to the old socket
             old_sub = self.sub
             
-            # Now safely unregister the old socket BEFORE updating the reference
-            try:
-                if old_sub:
-                    self.poller.unregister(old_sub)
-            except Exception as e:
-                self.logger.error(f"BrokerMW::handle_publisher_change - Error unregistering old socket: {str(e)}")
-            
-            # Register the new socket with the poller
-            self.poller.register(new_sub, zmq.POLLIN)
-            
-            # Make the new socket the current one AFTER updating the poller
-            self.sub = new_sub
+            # Use lock when modifying poller and sockets
+            with self.socket_lock:
+                # Now safely unregister the old socket BEFORE updating the reference
+                try:
+                    if old_sub:
+                        self.poller.unregister(old_sub)
+                except Exception as e:
+                    self.logger.error(f"BrokerMW::handle_publisher_change - Error unregistering old socket: {str(e)}")
+                
+                # Register the new socket with the poller
+                self.poller.register(new_sub, zmq.POLLIN)
+                
+                # Make the new socket the current one AFTER updating the poller
+                self.sub = new_sub
             
             # Now close the old socket
             try:
@@ -280,8 +284,10 @@ class BrokerMW():
                 time.sleep(0.01)  # Short sleep to prevent CPU spinning
                 return
                 
-            # Poll for events with the specified timeout
-            events = dict(self.poller.poll(timeout=timeout))
+            # Use lock when accessing poller
+            with self.socket_lock:
+                # Poll for events with the specified timeout
+                events = dict(self.poller.poll(timeout=timeout))
             
             if not events and self.upcall_obj:
                 # No events within timeout, let application decide what to do
@@ -429,7 +435,7 @@ class BrokerMW():
             
             broker_node = f"{broker_path}/{name}"
             address_str = f"{self.addr}:{self.port}"
-            self.zk_update_node(broker_node, address_str)
+            self.zk_update_node(broker_node, address_str, ephemeral=True)
             
             # Only register as a "publisher" if primary
             self._update_publisher_registration(self.is_primary)
@@ -453,7 +459,7 @@ class BrokerMW():
             if register:
                 # Register as a publisher
                 address_str = f"{self.addr}:{self.port}"
-                self.zk_update_node(broker_as_pub_node, address_str)
+                self.zk_update_node(broker_as_pub_node, address_str, ephemeral=True)
                 self.logger.info(f"BrokerMW::_update_publisher_registration - Registered as publisher: {broker_as_pub_node}")
             else:
                 # Remove publisher registration
@@ -522,7 +528,7 @@ class BrokerMW():
     ########################################
     # ZooKeeper Update Node
     ########################################
-    def zk_update_node(self, path, data):
+    def zk_update_node(self, path, data, ephemeral=True):
         """Create or update a ZooKeeper node with data"""
         try:
             if isinstance(data, str):
@@ -534,7 +540,7 @@ class BrokerMW():
                 self.zk.set(path, encoded_data)
                 self.logger.info(f"BrokerMW::zk_update_node - Updated: {path}")
             else:
-                self.zk.create(path, encoded_data)
+                self.zk.create(path, encoded_data, ephemeral=ephemeral)
                 self.logger.info(f"BrokerMW::zk_update_node - Created: {path}")
             return True
         except Exception as e:
