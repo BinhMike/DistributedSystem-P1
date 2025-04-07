@@ -6,14 +6,21 @@ from mininet.util import dumpNodeConnections
 from mininet.log import setLogLevel
 from mininet.nodelib import NAT
 from mininet.cli import CLI
+from mininet.node import OVSController, RemoteController, OVSKernelSwitch
 
 
 def run():
-    zookeeper_ip = "172.16.52.133"  # Your VM's IP address
+    # Set higher log level for debugging
+    setLogLevel('info')
 
-    net = Mininet()
+    print("Creating Mininet with OVSController")
+    net = Mininet(switch=OVSKernelSwitch, controller=OVSController)
+
+    print("Adding controller")
+    c0 = net.addController('c0')
 
     # Create hosts
+    print("Creating hosts")
     h1 = net.addHost('h1')  # Discovery 1
     h2 = net.addHost('h2')  # Discovery 2
     h3 = net.addHost('h3')  # Discovery 3
@@ -22,19 +29,30 @@ def run():
     h6 = net.addHost('h6')  # Broker 3
     h7 = net.addHost('h7')  # Publisher
     h8 = net.addHost('h8')  # Subscriber
-    h9 = net.addHost('h9')  # (Optional extra host)
+    h9 = net.addHost('h9')  # Zookeeper host
 
     # Create switch
+    print("Creating switch")
     s1 = net.addSwitch('s1')
 
     # Link hosts to switch
-    for h in [h1,h2,h3,h4,h5,h6,h7,h8,h9]:
+    print("Creating links")
+    for h in [h1, h2, h3, h4, h5, h6, h7, h8, h9]:
         net.addLink(h, s1)
 
-    nat = net.addNAT().configDefault()  # This sets up iptables and routing
+    print("Starting network")
     net.start()
-
-    # Get IPs
+    
+    # Extended network testing
+    print("Network interfaces on h1:")
+    print(h1.cmd('ifconfig'))
+    
+    print("Network interfaces on h2:")
+    print(h2.cmd('ifconfig'))
+    
+    print("Switch flow tables:")
+    print(s1.cmd('ovs-ofctl dump-flows s1'))
+    # Get IPs (after connectivity verification)
     h1_ip = h1.IP()
     h2_ip = h2.IP()
     h3_ip = h3.IP()
@@ -43,7 +61,16 @@ def run():
     h6_ip = h6.IP()
     h7_ip = h7.IP()
     h8_ip = h8.IP()
-
+    zookeeper_ip = h9.IP()
+    
+    # Start Zookeeper first on h9
+    #print("Starting Zookeeper on", zookeeper_ip)
+    #h9.cmd('xterm -hold -e "zkServer.sh start-foreground" &')
+    
+    # Wait for Zookeeper to initialize
+    import time
+    time.sleep(5)
+    
     # Start Discovery Services
     h1.cmd(f'xterm -hold -e "python3 DiscoveryAppln.py -p 5555 -a {h1_ip} -z {zookeeper_ip}:2181" &')
     h2.cmd(f'xterm -hold -e "python3 DiscoveryAppln.py -p 5556 -a {h2_ip} -z {zookeeper_ip}:2181" &')
@@ -62,12 +89,13 @@ def run():
 
     print("Dumping host connections")
     dumpNodeConnections(net.hosts)
-
+    
+    print("\n===== NETWORK SHOULD BE READY =====")
+    print("Starting Mininet CLI. Try testing connectivity with 'h1 ping h2'")
     CLI(net)
-
-    input("Press Enter to stop simulation...")
+    
+    print("Stopping network")
     net.stop()
 
 if __name__ == '__main__':
-    setLogLevel('info')
     run()
