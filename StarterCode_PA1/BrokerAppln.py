@@ -46,10 +46,13 @@ class BrokerAppln():
         self.name = None
         self.zk = None
         
-        # ZooKeeper paths
-        self.zk_path = "/brokers"
-        self.leader_path = "/brokers/leader"
-        self.replicas_path = "/brokers/replicas"
+        # Group-specific ZooKeeper paths
+        self.group = None  # Will store the broker group name
+        self.zk_path = "/brokers"  # Base path for all broker groups
+        # Group-specific paths will be constructed based on group name
+        # e.g., /brokers/group1/leader, /brokers/group1/replicas
+        self.leader_path = None  # Will be set dynamically based on group
+        self.replicas_path = None  # Will be set dynamically based on group
         
         # Capture SIGINT for clean shutdown
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -75,6 +78,13 @@ class BrokerAppln():
             self.name = args.name
             self.args = args
             self.broker_address = f"{args.addr}:{args.port}"
+            
+            # Set the broker group
+            self.group = args.group
+            
+            # Construct group-specific paths
+            self.leader_path = f"{self.zk_path}/{self.group}/leader"
+            self.replicas_path = f"{self.zk_path}/{self.group}/replicas"
             
             # Initialize ZooKeeper
             self._init_zookeeper(args.zookeeper)
@@ -106,8 +116,9 @@ class BrokerAppln():
         self.zk.start()
         self.logger.info("BrokerAppln::_init_zookeeper - Connected to ZooKeeper")
         
-        # Create necessary paths
+        # Create necessary paths for the specific group
         self.zk.ensure_path(self.zk_path)
+        self.zk.ensure_path(f"{self.zk_path}/{self.group}")
         self.zk.ensure_path(self.replicas_path)
 
     def _init_middleware(self, args):
@@ -283,7 +294,7 @@ class BrokerAppln():
         cmd = ["gnome-terminal", "--", "bash", "-c"]
         spawn_cmd = (f"python3 {sys.argv[0]} -p {free_port} -a {self.args.addr} "
                      f"-z {self.args.zookeeper} -n broker_replica_{free_port} "
-                     f"-l {self.args.loglevel}")
+                     f"-l {self.args.loglevel} -g {self.group}")
         
         # Add config flag only if it was provided
         if hasattr(self.args, 'config') and self.args.config:
@@ -398,6 +409,7 @@ def parseCmdLineArgs():
     parser.add_argument("-a", "--addr", default="localhost", help="Broker's advertised address") 
     parser.add_argument("-z", "--zookeeper", default="localhost:2181", help="ZooKeeper Address")
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, help="Logging level (default=INFO)")
+    parser.add_argument("-g", "--group", default="default_group", help="Broker group name")
     return parser.parse_args()
 
 
