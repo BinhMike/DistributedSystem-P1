@@ -224,14 +224,19 @@ class BrokerLoadBalancer:
                     # Remaining frames are the actual message
                     data = message[1:]
                     
-                    # Get topic from message (assuming topic is in second frame for simplicity)
+                    # Get topic from message
                     topic = None
                     if len(data) > 0:
                         try:
-                            # Try to extract topic - actual format depends on your protocol
-                            # This is a placeholder implementation
-                            topic_bytes = data[0]
-                            topic = topic_bytes.decode().split(':')[0]  # Naive topic extraction
+                            if proxy_type == "SUB":
+                                # For SUB messages, extract topic from subscription message
+                                # Assuming subscription messages are formatted with topic as first frame
+                                topic_bytes = data[0]
+                                topic = topic_bytes.decode()
+                            else:
+                                # For PUB messages, extract topic from publication format
+                                topic_bytes = data[0]
+                                topic = topic_bytes.decode().split(':')[0]  # Publication format: "topic:data"
                         except Exception:
                             topic = None
                     
@@ -248,7 +253,7 @@ class BrokerLoadBalancer:
                         else:
                             self.logger.warning(f"No primary available for group {target_group}, message dropped")
                     else:
-                        # Use round-robin for subscriber connections within the target group
+                        # For subscriptions, ONLY send to brokers that handle the requested topics
                         broker = self._get_next_broker_for_group(target_group)
                         if broker:
                             self.logger.debug(f"Routing {topic} subscription to broker {broker} in group {target_group}")
