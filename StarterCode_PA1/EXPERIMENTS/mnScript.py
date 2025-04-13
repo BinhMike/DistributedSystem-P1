@@ -35,11 +35,11 @@ def run():
     h10 = net.addHost('h10')  
     h11 = net.addHost('h11')  
     h12 = net.addHost('h12')  
-    h13 = net.addHost('h13')  
-
-    #h9.cmd(f'{zk_path}/zkServer.sh stop &')
-    #h9.cmd(f'{zk_path}/zkServer.sh start &')
-    #print(h9.cmd('jps'))
+    h13 = net.addHost('h13') 
+    h14 = net.addHost('h14')
+    h15 = net.addHost('h15')
+    h16 = net.addHost('h16')
+    h17 = net.addHost('h17')
 
     # Create switch
     print("Creating switch")
@@ -47,7 +47,7 @@ def run():
 
     # Link hosts to switch
     print("Creating links")
-    for h in [h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13]:
+    for h in [h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17]:
         net.addLink(h, s1)
 
     print("Starting network")
@@ -76,6 +76,10 @@ def run():
     h11_ip = h11.IP()
     h12_ip = h12.IP()
     h13_ip = h13.IP()
+    h14_ip = h14.IP()
+    h15_ip = h15.IP()
+    h16_ip = h16.IP()
+    h17_ip = h17.IP()
 
     
     # Configure ZooKeeper
@@ -100,20 +104,28 @@ def run():
     h3.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 DiscoveryAppln.py -p 5556 -a {h3_ip} -z {zookeeper_ip}:2181" &')
     h4.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 DiscoveryAppln.py -p 5557 -a {h4_ip} -z {zookeeper_ip}:2181" &')
 
-    # Start Brokers
-    h5.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker1 -p 6000 --addr {h5_ip} -z {zookeeper_ip}:2181 -g group1" &')
-    h6.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker2 -p 6001 --addr {h6_ip} -z {zookeeper_ip}:2181 -g group1" &')
-    h7.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker3 -p 6002 --addr {h7_ip} -z {zookeeper_ip}:2181 -g group1" &')
+    # Start Broker Load Balancer (now on h5)
+    h5.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerLB.py --addr {h5_ip} -z {zookeeper_ip}:2181" &')
 
-    # h8.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker4 -p 6000 --addr {h8_ip} -z {zookeeper_ip}:2181 -g group2" &')
-    # h9.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker5 -p 6001 --addr {h9_ip} -z {zookeeper_ip}:2181 -g group2" &')
-    # h10.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker6 -p 6002 --addr {h10_ip} -z {zookeeper_ip}:2181 -g group2" &')
+    # Start Brokers - Group 1 
+    h6.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker1 -p 6000 --addr {h6_ip} -z {zookeeper_ip}:2181 -g group1" &')
+    h7.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker2 -p 6001 --addr {h7_ip} -z {zookeeper_ip}:2181 -g group1" &')
+    h8.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker3 -p 6002 --addr {h8_ip} -z {zookeeper_ip}:2181 -g group1" &')
 
-    # Start Publisher
-    h11.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 PublisherAppln.py -n pub1 -a {h11_ip} -p 5577 -z {zookeeper_ip}:2181 -T 2 -f 1 -i 1000 -l 20" &')
+    # Start Brokers - Group 2 
+    h9.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker4 -p 6000 --addr {h9_ip} -z {zookeeper_ip}:2181 -g group2" &')
+    h10.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker5 -p 6001 --addr {h10_ip} -z {zookeeper_ip}:2181 -g group2" &')
+    h11.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker6 -p 6002 --addr {h11_ip} -z {zookeeper_ip}:2181 -g group2" &')
 
-    # Start Subscriber
-    h12.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 SubscriberAppln.py -n sub1 -z {zookeeper_ip}:2181 -T 9 -l 20" &')
+    # Start Publishers (using h12, h13, h14)
+    h12.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 PublisherAppln.py -n pub1 -a {h12_ip} -p 5577 -z {zookeeper_ip}:2181 -T 2 -f 1 -i 1000 -l 20" &')
+    h13.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 PublisherAppln.py -n pub2 -a {h13_ip} -p 5578 -z {zookeeper_ip}:2181 -T 2 -f 1 -i 1000 -l 20" &')
+    h14.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 PublisherAppln.py -n pub3 -a {h14_ip} -p 5579 -z {zookeeper_ip}:2181 -T 2 -f 1 -i 1000 -l 20" &')
+
+    # Start Subscribers (using h15, h16)
+    h15.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 SubscriberAppln.py -n sub1 -z {zookeeper_ip}:2181 -T 9 -l 20" &')
+    h16.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 SubscriberAppln.py -n sub2 -z {zookeeper_ip}:2181 -T 9 -l 20" &')
+    h17.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 SubscriberAppln.py -n sub3 -z {zookeeper_ip}:2181 -T 9 -l 20" &')
 
     print("Dumping host connections")
     dumpNodeConnections(net.hosts)
