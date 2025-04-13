@@ -124,8 +124,50 @@ class BrokerAppln():
     def _init_middleware(self, args):
         """Initialize the middleware component."""
         self.logger.debug("BrokerAppln::_init_middleware - Initializing middleware")
+        
+        # Initialize middleware with the right primary status
         self.mw_obj = BrokerMW(self.logger, self.zk, False)
         self.mw_obj.configure(args)
+        
+        # By default, look for a load balancer in ZooKeeper
+        if self._find_and_connect_to_lb():
+            self.logger.info("Connected to load balancer automatically")
+        else:
+            self.logger.info("No load balancer found, operating in standalone mode")
+
+    def _find_and_connect_to_lb(self):
+        """Find and connect to a load balancer if available in ZooKeeper."""
+        try:
+            # Check if the load balancer node exists in ZooKeeper
+            lb_path = "/load_balancers"
+            if not self.zk.exists(lb_path):
+                self.logger.info("No load balancer path found in ZooKeeper")
+                return False
+                
+            # Get all registered load balancers
+            lb_nodes = self.zk.get_children(lb_path)
+            if not lb_nodes:
+                self.logger.info("No load balancers registered in ZooKeeper")
+                return False
+                
+            # Use the first load balancer found
+            lb_node_path = f"{lb_path}/{lb_nodes[0]}"
+            lb_data, _ = self.zk.get(lb_node_path)
+            lb_info = lb_data.decode().split(":")
+            
+            if len(lb_info) != 3:
+                self.logger.error(f"Invalid load balancer data format: {lb_data.decode()}")
+                return False
+                
+            lb_addr, pub_port, sub_port = lb_info
+            self.logger.info(f"Found load balancer at {lb_addr} with ports {pub_port}/{sub_port}")
+            
+            # Connect to the load balancer
+            return self.mw_obj.connect_to_lb(lb_addr, int(pub_port), self.group)
+            
+        except Exception as e:
+            self.logger.error(f"Error finding load balancer: {str(e)}")
+            return False
 
     def _setup_replica_tracking(self):
         """Register this broker as a replica and setup watch for other replicas."""
@@ -410,6 +452,7 @@ def parseCmdLineArgs():
     parser.add_argument("-z", "--zookeeper", default="localhost:2181", help="ZooKeeper Address")
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, help="Logging level (default=INFO)")
     parser.add_argument("-g", "--group", default="default_group", help="Broker group name")
+    
     return parser.parse_args()
 
 

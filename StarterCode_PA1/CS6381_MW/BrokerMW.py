@@ -223,6 +223,39 @@ class BrokerMW():
             return False
 
     ########################################
+    # Connect to Load Balancer
+    ########################################
+    def connect_to_lb(self, lb_addr, lb_port, group_name):
+        """Connect to the load balancer for managed message routing"""
+        try:
+            self.logger.info(f"BrokerMW::connect_to_lb - Connecting to LB at {lb_addr}:{lb_port}")
+            
+            # Create a special dealer socket for load balancer communication
+            self.lb_socket = self.create_socket(zmq.DEALER)
+            
+            # Set socket identity to the group name to help load balancer routing
+            self.lb_socket.setsockopt_string(zmq.IDENTITY, group_name)
+            
+            # Connect to load balancer
+            lb_endpoint = f"tcp://{lb_addr}:{lb_port}"
+            self.lb_socket.connect(lb_endpoint)
+            
+            # Add to poller
+            self.poller.register(self.lb_socket, zmq.POLLIN)
+            
+            # Store group name for load balancer identification
+            self.group_name = group_name
+            
+            # Mark that we're using load balancer mode
+            self.using_lb = True
+            
+            self.logger.info(f"BrokerMW::connect_to_lb - Connected to LB for group {group_name}")
+            return True
+        except Exception as e:
+            self.logger.error(f"BrokerMW::connect_to_lb - Error connecting to LB: {str(e)}")
+            return False
+
+    ########################################
     # Update Primary Status
     ########################################
     def update_primary_status(self, is_primary):

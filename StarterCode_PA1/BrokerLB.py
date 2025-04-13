@@ -4,6 +4,7 @@ import argparse
 import logging
 import signal
 import threading
+import traceback
 import zmq
 
 from kazoo.client import KazooClient
@@ -65,6 +66,9 @@ class BrokerLoadBalancer:
             
             # Set up backend socket
             self._setup_backend_socket()
+            
+            # Register the load balancer in ZooKeeper for auto-discovery
+            self._register_in_zookeeper(args.addr or "localhost", args.pub_port, args.sub_port)
             
             self.logger.info("BrokerLoadBalancer::configure - Configuration complete")
             return True
@@ -176,6 +180,32 @@ class BrokerLoadBalancer:
         except Exception as e:
             self.logger.error(f"Error disconnecting from broker {broker_addr}: {str(e)}")
     
+    def _register_in_zookeeper(self, addr, pub_port, sub_port):
+        """Register the load balancer in ZooKeeper for auto-discovery."""
+        try:
+            # Create the load balancer path if it doesn't exist
+            lb_path = "/load_balancers"
+            self.zk.ensure_path(lb_path)
+            
+            # Create a node for this load balancer instance
+            lb_id = f"lb_{addr}_{pub_port}"
+            lb_node_path = f"{lb_path}/{lb_id}"
+            
+            # Store connection information in the format addr:pub_port:sub_port
+            lb_data = f"{addr}:{pub_port}:{sub_port}"
+            
+            # Create or update the node (using ephemeral node that will be removed if LB crashes)
+            if self.zk.exists(lb_node_path):
+                self.zk.delete(lb_node_path)
+            
+            self.zk.create(lb_node_path, lb_data.encode(), ephemeral=True)
+            self.logger.info(f"Registered load balancer in ZooKeeper at {lb_node_path}")
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"Error registering in ZooKeeper: {str(e)}")
+            return False
+    
     def run(self):
         """Run the load balancer proxy."""
         try:
@@ -218,59 +248,74 @@ class BrokerLoadBalancer:
                 events = dict(poller.poll(1000))  # 1 second timeout
                 
                 if frontend in events:
+                    # Get all message parts
                     message = frontend.recv_multipart()
-                    # First frame is client identity, preserve it
-                    identity = message[0]
-                    # Remaining frames are the actual message
-                    data = message[1:]
                     
-                    # Get topic from message
-                    topic = None
-                    if len(data) > 0:
-                        try:
-                            if proxy_type == "SUB":
-                                # For SUB messages, extract topic from subscription message
-                                # Assuming subscription messages are formatted with topic as first frame
-                                topic_bytes = data[0]
-                                topic = topic_bytes.decode()
-                            else:
-                                # For PUB messages, extract topic from publication format
-                                topic_bytes = data[0]
-                                topic = topic_bytes.decode().split(':')[0]  # Publication format: "topic:data"
-                        except Exception:
-                            topic = None
-                    
-                    # Determine target group based on topic
-                    target_group = self._get_group_for_topic(topic)
-                    
-                    # Route message based on type and load balancing strategy
-                    if proxy_type == "PUB":
-                        # Publications go to primary broker of the target group
-                        primary = self._get_primary_for_group(target_group)
-                        if primary:
-                            self.logger.debug(f"Routing {topic} publication to primary broker {primary} in group {target_group}")
-                            backend.send_multipart([identity] + data)
-                        else:
-                            self.logger.warning(f"No primary available for group {target_group}, message dropped")
-                    else:
-                        # For subscriptions, ONLY send to brokers that handle the requested topics
-                        broker = self._get_next_broker_for_group(target_group)
-                        if broker:
-                            self.logger.debug(f"Routing {topic} subscription to broker {broker} in group {target_group}")
-                            backend.send_multipart([identity] + data)
-                        else:
-                            self.logger.warning(f"No brokers available for group {target_group}, message dropped")
-                
-                if backend in events:
-                    message = backend.recv_multipart()
                     # First frame is client identity
                     identity = message[0]
-                    # Remaining frames are the actual message
-                    data = message[1:]
-                    frontend.send_multipart([identity] + data)
+                    
+                    # Extract topic from message for routing
+                    topic = self._extract_topic(message, proxy_type)
+                    target_group = self._get_group_for_topic(topic)
+                    
+                    # Route based on message type
+                    if proxy_type == "PUB":
+                        # For publishers, ensure we send to primary broker in the group
+                        primary = self._get_primary_for_group(target_group)
+                        if primary:
+                            self.logger.debug(f"Routing '{topic}' publication to primary broker in group {target_group}")
+                            backend.send_multipart(message)
+                        else:
+                            self.logger.warning(f"No primary broker available for {target_group}, message dropped: {topic}")
+                    else:
+                        # For subscribers, use round-robin load balancing within group
+                        broker = self._get_next_broker_for_group(target_group)
+                        if broker:
+                            self.logger.debug(f"Routing '{topic}' subscription to broker in group {target_group}")
+                            backend.send_multipart(message)
+                        else:
+                            self.logger.warning(f"No brokers available for {target_group}, message dropped: {topic}")
+                
+                if backend in events:
+                    # Simply pass messages from backend to frontend
+                    message = backend.recv_multipart()
+                    frontend.send_multipart(message)
         
         except Exception as e:
             self.logger.error(f"{proxy_type} proxy thread error: {str(e)}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            
+    def _extract_topic(self, message, proxy_type):
+        """Extract topic from message parts based on message type."""
+        try:
+            if len(message) < 2:
+                return None
+                
+            # Skip identity frame
+            content = message[1:]
+            
+            if not content or not content[0]:
+                return None
+                
+            data = content[0]
+            
+            if proxy_type == "SUB":
+                # For SUB messages, the first part is typically the subscription topic
+                # or could be a command like SUBSCRIBE
+                topic = data.decode() if isinstance(data, bytes) else str(data)
+                # If it's a subscription command, the real topic is in the next frame
+                if topic == "SUBSCRIBE" and len(content) > 1:
+                    topic = content[1].decode() if isinstance(content[1], bytes) else str(content[1])
+                return topic
+            else:
+                # For PUB messages, decode and extract topic from the format "topic:timestamp:data"
+                data_str = data.decode() if isinstance(data, bytes) else str(data)
+                parts = data_str.split(":", 1)
+                topic = parts[0] if parts else None
+                return topic
+        except Exception as e:
+            self.logger.error(f"Error extracting topic: {str(e)}")
+            return None
 
     def _get_group_for_topic(self, topic):
         """Determine which broker group should handle a given topic."""
@@ -345,6 +390,8 @@ def parse_args():
                       help="Default broker group for topics without explicit mapping")
     parser.add_argument("-m", "--topic-map", default="",
                       help="Topic to group mapping in format topic1:group1,topic2:group2")
+    parser.add_argument("--addr", default="localhost",
+                      help="Address of the load balancer for ZooKeeper registration")
     return parser.parse_args()
 
 
