@@ -110,6 +110,36 @@ class BrokerLoadBalancer:
         leader_path = f"{group_path}/leader"
         replicas_path = f"{group_path}/replicas"
         
+        # Initialize leader data immediately if it exists, don't wait for watch event
+        if self.zk.exists(leader_path):
+            try:
+                data, _ = self.zk.get(leader_path)
+                if data:
+                    leader_info = data.decode().split('|')[0]
+                    self.broker_groups[group]["leader"] = leader_info
+                    self.logger.info(f"Group {group} primary broker initialized: {leader_info}")
+            except Exception as e:
+                self.logger.error(f"Error initializing leader for {group}: {str(e)}")
+        
+        # Initialize replica data immediately if it exists, don't wait for watch event
+        if self.zk.exists(replicas_path):
+            try:
+                children = self.zk.get_children(replicas_path)
+                self.logger.info(f"Initial scan: Group {group} has {len(children)} replica nodes")
+                
+                for broker_id in children:
+                    try:
+                        broker_path = f"{replicas_path}/{broker_id}"
+                        data, _ = self.zk.get(broker_path)
+                        broker_addr = data.decode()
+                        self.broker_groups[group]["replicas"].add(broker_addr)
+                        self.logger.info(f"Added broker replica: {broker_addr} for group {group}")
+                        self._connect_to_broker(broker_addr)
+                    except Exception as e:
+                        self.logger.error(f"Error processing replica {broker_id}: {str(e)}")
+            except Exception as e:
+                self.logger.error(f"Error initializing replicas for {group}: {str(e)}")
+        
         # Watch for leader changes
         @self.zk.DataWatch(leader_path)
         def watch_leader(data, stat, event):
@@ -165,11 +195,42 @@ class BrokerLoadBalancer:
     def _connect_to_broker(self, broker_addr):
         """Connect to a broker instance."""
         try:
+            # Ensure the broker address is properly formatted for ZMQ connection
+            # Sometimes broker_addr might contain additional data or wrong format
+            if not broker_addr:
+                self.logger.error(f"Invalid broker address: empty")
+                return
+                
+            # Remove any trailing information (like lease data after '|')
+            if '|' in broker_addr:
+                broker_addr = broker_addr.split('|')[0]
+            
+            # Ensure the address has both host and port
+            if ':' not in broker_addr:
+                self.logger.error(f"Invalid broker address format: {broker_addr}")
+                return
+                
+            # Format the connection URL
             connection_url = f"tcp://{broker_addr}"
+            
+            # Log connection attempt with full details
+            self.logger.info(f"Connecting to broker at {connection_url} (raw addr: {broker_addr})")
+            
+            try:
+                # Check if already connected
+                if hasattr(self.backend, '_endpoints') and connection_url in self.backend._endpoints:
+                    self.logger.info(f"Already connected to {connection_url}")
+                    return
+            except Exception as e:
+                self.logger.warning(f"Error checking existing connections: {str(e)}")
+            
+            # Connect to broker
             self.backend.connect(connection_url)
-            self.logger.info(f"Connected to broker at {connection_url}")
+            self.logger.info(f"Successfully connected to broker at {connection_url}")
+            
         except Exception as e:
             self.logger.error(f"Error connecting to broker {broker_addr}: {str(e)}")
+            self.logger.error(traceback.format_exc())
     
     def _disconnect_from_broker(self, broker_addr):
         """Disconnect from a broker instance."""
@@ -224,9 +285,57 @@ class BrokerLoadBalancer:
             
             # Main thread monitors and maintains broker connections
             while True:
-                if not any(group["replicas"] for group in self.broker_groups.values()):
-                    self.logger.warning("No active brokers available")
-                time.sleep(2)
+                # Enhanced debug logging to diagnose broker connectivity issues
+                self.logger.info("---- Broker Group Status Check ----")
+                if self.broker_groups:
+                    for group_name, group_data in self.broker_groups.items():
+                        self.logger.info(f"Group: {group_name}")
+                        self.logger.info(f"  Leader: {group_data['leader']}")
+                        self.logger.info(f"  Replicas: {group_data['replicas']}")
+                        
+                        # Check if the leader node exists in ZooKeeper
+                        leader_path = f"{self.brokers_path}/{group_name}/leader"
+                        if self.zk.exists(leader_path):
+                            try:
+                                data, _ = self.zk.get(leader_path)
+                                self.logger.info(f"  Leader ZK data: {data.decode() if data else 'None'}")
+                            except Exception as e:
+                                self.logger.error(f"  Error getting leader data: {str(e)}")
+                        else:
+                            self.logger.warning(f"  Leader path {leader_path} does not exist!")
+                            
+                        # Check if replicas exist
+                        replicas_path = f"{self.brokers_path}/{group_name}/replicas"
+                        if self.zk.exists(replicas_path):
+                            try:
+                                children = self.zk.get_children(replicas_path)
+                                self.logger.info(f"  Replica nodes in ZK: {children}")
+                                for child in children:
+                                    child_path = f"{replicas_path}/{child}"
+                                    data, _ = self.zk.get(child_path)
+                                    self.logger.info(f"    Replica {child}: {data.decode() if data else 'None'}")
+                            except Exception as e:
+                                self.logger.error(f"  Error getting replica data: {str(e)}")
+                        else:
+                            self.logger.warning(f"  Replicas path {replicas_path} does not exist!")
+                else:
+                    # Dump the current state of the /brokers directory
+                    self.logger.warning("No broker groups found in self.broker_groups!")
+                    try:
+                        if self.zk.exists(self.brokers_path):
+                            children = self.zk.get_children(self.brokers_path)
+                            self.logger.info(f"ZooKeeper {self.brokers_path} contains: {children}")
+                            for child in children:
+                                if child.startswith("group"):
+                                    group_path = f"{self.brokers_path}/{child}"
+                                    group_children = self.zk.get_children(group_path)
+                                    self.logger.info(f"  {child} contains: {group_children}")
+                        else:
+                            self.logger.warning(f"{self.brokers_path} path does not exist in ZooKeeper!")
+                    except Exception as e:
+                        self.logger.error(f"Error inspecting ZooKeeper: {str(e)}")
+                
+                time.sleep(5)  # Increased for less frequent logs
                 
         except KeyboardInterrupt:
             self.logger.info("BrokerLoadBalancer::run - Interrupted")

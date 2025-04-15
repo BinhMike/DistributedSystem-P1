@@ -178,8 +178,37 @@ class SubscriberAppln:
             raise e
 
     def _try_connect_to_brokers(self):
-        """Try to discover and connect to brokers directly through ZooKeeper"""
+        """Try to discover and connect to load balancers or brokers directly through ZooKeeper"""
         try:
+            # First, try to find and connect to load balancers
+            if self.zk.exists(self.zk_paths["load_balancers"]):
+                self.logger.info("Checking for load balancers in ZooKeeper")
+                lb_nodes = self.zk.get_children(self.zk_paths["load_balancers"])
+                
+                if lb_nodes:
+                    self.logger.info(f"Found load balancers: {lb_nodes}")
+                    for lb_node in lb_nodes:
+                        lb_path = f"{self.zk_paths['load_balancers']}/{lb_node}"
+                        data, _ = self.zk.get(lb_path)
+                        
+                        if data:
+                            # Load balancer data format is "addr:pub_port:sub_port"
+                            lb_info = data.decode()
+                            self.logger.info(f"Load balancer info: {lb_info}")
+                            
+                            parts = lb_info.split(":")
+                            if len(parts) >= 3:
+                                lb_addr = parts[0]
+                                lb_sub_port = parts[2]  # Use the subscriber port from the LB
+                                pub_address = f"tcp://{lb_addr}:{lb_sub_port}"
+                                
+                                self.logger.info(f"Connecting to load balancer at {pub_address}")
+                                self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
+                                return  # Successfully connected to a load balancer
+            
+            # If no load balancer found, fall back to direct broker connection
+            self.logger.info("No load balancers found, trying direct broker connection")
+            
             if not self.zk.exists(self.zk_paths["brokers"]):
                 self.logger.info("No broker groups found in ZooKeeper")
                 return
@@ -215,12 +244,10 @@ class SubscriberAppln:
                                  time.sleep(0.2 * (attempt + 1)) # Exponential backoff delay
                             else:
                                  self.logger.error(f"Broker leader node {leader_path} still has no data after {retries} attempts. Skipping group {group}.")
-                                 # Continue to the next group in the outer loop
-                                 continue # This continue skips the rest of the code for *this* group
-
+                                 continue
+                    
                     # Check if data was successfully retrieved after retries
                     if not data:
-                        # This continue was moved here from the inner else block
                         continue # Skip to the next group if no data after retries
 
                     # Decode and extract addr:port, handling potential lease info
@@ -239,21 +266,13 @@ class SubscriberAppln:
                     pub_address = f"tcp://{broker_addr_port}"
                     
                     self.logger.info(f"Connecting directly to broker leader at {pub_address} for group {group}")
-                    # Use a set to avoid duplicate connections if multiple groups have the same leader
-                    # (This requires mw_obj to handle duplicate subscriptions gracefully or track connections)
-                    self.mw_obj.subscribe_to_topics(pub_address, self.topiclist) 
-                    # Assuming connecting to one leader per group is sufficient in this fallback scenario.
-                    # If you need to connect to *all* leaders, remove the break.
-                    # If you only need *one* broker connection total, move the break outside the 'if self.zk.exists...'
-                    
-                else:
-                    self.logger.info(f"No leader found for group {group} at {leader_path}")
+                    self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)                     
                     
         except Exception as e:
-            self.logger.error(f"Error connecting directly to brokers: {str(e)}")
-            # Optionally log traceback for more detail
-            # import traceback
-            # self.logger.error(traceback.format_exc())
+            self.logger.error(f"Error connecting to load balancers or brokers: {str(e)}")
+            # Log detailed traceback for debugging
+            import traceback
+            self.logger.error(traceback.format_exc())
 
     def process_message(self, topic, content):
         """ Process received messages from publishers """

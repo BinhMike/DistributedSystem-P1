@@ -184,8 +184,37 @@ class BrokerAppln():
             lb_addr, pub_port, sub_port = lb_info
             self.logger.info(f"Found load balancer at {lb_addr} with ports {pub_port}/{sub_port}")
             
-            # Connect to the load balancer
-            return self.mw_obj.connect_to_lb(lb_addr, int(pub_port), self.group)
+            # Ensure proper broker group structure in ZooKeeper before connecting
+            group_path = f"{self.zk_paths['brokers']}/{self.group}"
+            self.zk.ensure_path(group_path)
+            
+            # Make sure replica registration is done properly
+            try:
+                replica_node = f"{self.replicas_path}/{self.broker_address}"
+                if not self.zk.exists(replica_node):
+                    self.zk.create(replica_node, self.broker_address.encode(), ephemeral=True)
+                    self.logger.info(f"Registered as replica at {replica_node}")
+            except Exception as e:
+                self.logger.warning(f"Error registering replica: {str(e)}")
+            
+            # Make sure leader node exists for load balancer to find
+            try:
+                if not self.zk.exists(self.leader_path) and self.is_primary:
+                    leader_data = f"{self.broker_address}|{time.time()+30}"
+                    self.zk.create(self.leader_path, leader_data.encode(), ephemeral=True)
+                    self.logger.info(f"Created leader node at {self.leader_path}")
+            except Exception as e:
+                self.logger.warning(f"Error creating leader node: {str(e)}")
+            
+            # Connect to the load balancer with the group name for proper routing
+            result = self.mw_obj.connect_to_lb(lb_addr, int(pub_port), self.group)
+            
+            if result:
+                self.logger.info(f"Successfully connected to load balancer at {lb_addr}:{pub_port}")
+            else:
+                self.logger.error(f"Failed to connect to load balancer at {lb_addr}:{pub_port}")
+                
+            return result
             
         except Exception as e:
             self.logger.error(f"Error finding load balancer: {str(e)}")
@@ -193,15 +222,29 @@ class BrokerAppln():
 
     def _setup_replica_tracking(self):
         """Register this broker as a replica and setup watch for other replicas."""
-        # Register this instance as a replica
+        # Register this instance as a replica with proper formatting for the load balancer
         replica_node = f"{self.replicas_path}/{self.broker_address}"
         try:
+            # Store the broker address in a format that the load balancer can use
+            # Make sure it's just the raw address:port with no extra data
             self.zk.create(replica_node, self.broker_address.encode(), ephemeral=True)
-            self.logger.info(f"Registered replica node: {replica_node}")
+            self.logger.info(f"Registered replica node: {replica_node} with data: {self.broker_address}")
+            
+            # Verify the data was stored correctly
+            try:
+                data, _ = self.zk.get(replica_node)
+                if data:
+                    self.logger.info(f"Verified replica data: {data.decode()}")
+            except Exception as e:
+                self.logger.error(f"Error verifying replica data: {str(e)}")
+                
         except NodeExistsError:
+            # If node already exists, update it to ensure correct data format
             self.zk.delete(replica_node)
             self.zk.create(replica_node, self.broker_address.encode(), ephemeral=True)
-            self.logger.info(f"Updated replica node: {replica_node}")
+            self.logger.info(f"Updated replica node: {replica_node} with data: {self.broker_address}")
+        except Exception as e:
+            self.logger.error(f"Error registering replica: {str(e)}")
 
         # Setup watch on replicas for quorum maintenance
         @self.zk.ChildrenWatch(self.replicas_path)
