@@ -304,15 +304,15 @@ class DiscoveryAppln:
         if not self.quorum_met():
             self.logger.warning("Quorum not met. Rejecting registration.")
             response = discovery_pb2.DiscoveryResp()
-            response.msg_type = discovery_pb2.TYPE_REGISTER
-            response.register_resp.status = discovery_pb2.STATUS_CHECK_AGAIN
+            response.msg_type = discovery_pb2.MsgTypes.TYPE_REGISTER
+            response.register_resp.status = discovery_pb2.Status.STATUS_CHECK_AGAIN
             response.register_resp.reason = "Quorum not met; please wait until all replicas are active."
             return response
 
         role_map = {
-            discovery_pb2.ROLE_PUBLISHER: "Publisher",
-            discovery_pb2.ROLE_SUBSCRIBER: "Subscriber",
-            discovery_pb2.ROLE_BOTH: "Broker"
+            discovery_pb2.Role.ROLE_PUBLISHER: "Publisher",
+            discovery_pb2.Role.ROLE_SUBSCRIBER: "Subscriber",
+            discovery_pb2.Role.ROLE_BOTH: "Broker"
         }
         role = role_map.get(register_req.role, "Unknown")
         entity_id = register_req.info.id
@@ -321,21 +321,41 @@ class DiscoveryAppln:
         if not self.is_primary:
             self.logger.warning("Not primary; cannot process registration. Inform client to contact the leader.")
             response = discovery_pb2.DiscoveryResp()
-            response.msg_type = discovery_pb2.TYPE_REGISTER
-            response.register_resp.status = discovery_pb2.STATUS_NOT_PRIMARY
+            response.msg_type = discovery_pb2.MsgTypes.TYPE_REGISTER
+            response.register_resp.status = discovery_pb2.Status.STATUS_FAILURE
+            if self.leader_path and self.zk.exists(self.leader_path):
+                try:
+                    leader_data, _ = self.zk.get(self.leader_path)
+                    leader_addr = leader_data.decode().split('|')[0]  # Extract address from lease info
+                    response.register_resp.reason = f"Not primary. Please contact primary at {leader_addr}"
+                except Exception as e:
+                    self.logger.error(f"Error getting leader info: {str(e)}")
+                    response.register_resp.reason = "Not primary. Unable to determine primary; please retry."
+            else:
+                response.register_resp.reason = "Not primary. No primary available; please retry later."
             return response
 
-        # For Publishers, compute a virtual group mapping for each topic.
+        # For publishers, assign topics to virtual groups using consistent hashing
         topic_group_info = {}
-        if role == "Publisher":
+        if role == "Publisher" and register_req.topiclist:
+            # Assign each topic to a virtual group (deterministically)
             for topic in register_req.topiclist:
-                group_id = consistent_hash(topic) % self.num_virtual_groups
-                topic_group_info[topic] = group_id
-                self.logger.debug(f"Computed virtual group {group_id} for topic '{topic}' for publisher {entity_id}")
-            mapping_str = ",".join([f"{t}:{topic_group_info[t]}" for t in topic_group_info])
-            entity_data = f"{register_req.info.addr}:{register_req.info.port}|{mapping_str}"
-            self.logger.info(f"Publisher {entity_id} assigned virtual group mapping: {mapping_str}")
+                group = consistent_hash(topic) % self.num_virtual_groups
+                topic_group_info[topic] = group
+                self.logger.info(f"Assigned topic '{topic}' to virtual group {group}")
+            
+            # Format as topic1:group1,topic2:group2
+            topic_mapping = ",".join([f"{t}:{g}" for t, g in topic_group_info.items()])
+            
+            # Store mapping for broker lookup purposes
+            entity_id_with_group = f"{entity_id}:grp={list(topic_group_info.values())[0]}"
+            self.logger.info(f"Publisher ID with group: {entity_id_with_group}")
+            
+            # Format entity data with virtual group mapping
+            entity_data = f"{register_req.info.addr}:{register_req.info.port}|{topic_mapping}"
         else:
+            topic_mapping = ""
+            entity_id_with_group = entity_id
             entity_data = f"{register_req.info.addr}:{register_req.info.port}"
             # Log that no virtual group assignment is performed for subscribers or brokers.
             self.logger.info(f"{role} {entity_id} registered without virtual group assignment.")
@@ -354,6 +374,7 @@ class DiscoveryAppln:
                 self.zk.delete(entity_path)
             self.zk.create(entity_path, entity_data.encode(), ephemeral=True)
             self.logger.info(f"Created/updated ZooKeeper node {entity_path} with data: {entity_data}")
+            
             # For brokers, also register in the replicas path for quorum management.
             if role == "Broker" and category == "brokers":
                 broker_replica_path = f"/brokers/replicas/{entity_id}"
@@ -365,8 +386,9 @@ class DiscoveryAppln:
         except Exception as e:
             self.logger.error(f"Failed to register {role} in ZooKeeper: {str(e)}")
             response = discovery_pb2.DiscoveryResp()
-            response.msg_type = discovery_pb2.TYPE_REGISTER
-            response.register_resp.status = discovery_pb2.STATUS_FAILURE
+            response.msg_type = discovery_pb2.MsgTypes.TYPE_REGISTER
+            response.register_resp.status = discovery_pb2.Status.STATUS_FAILURE
+            response.register_resp.reason = f"Failed to register in ZooKeeper: {str(e)}"
             return response
 
         # Update the in-memory registry.
@@ -377,18 +399,24 @@ class DiscoveryAppln:
         }
         if role == "Publisher":
             entry["group_mapping"] = topic_group_info
-        self.registry[category][entity_id] = entry
+        self.registry[category][entity_id if role != "Publisher" else entity_id_with_group] = entry
 
         response = discovery_pb2.DiscoveryResp()
-        response.msg_type = discovery_pb2.TYPE_REGISTER
-        response.register_resp.status = discovery_pb2.STATUS_SUCCESS
+        response.msg_type = discovery_pb2.MsgTypes.TYPE_REGISTER
+        response.register_resp.status = discovery_pb2.Status.STATUS_SUCCESS
+        
+        # If this is a publisher, include group mapping in the reason field
+        if role == "Publisher" and topic_mapping:
+            response.register_resp.reason = topic_mapping
+            self.logger.info(f"Sending topic mapping in response reason: {topic_mapping}")
+            
         return response
 
     ########################################
     # Handle Lookup Request with Filtering by Virtual Group
     ########################################
     def lookup(self, lookup_req):
-        """Handle subscriber lookup request and return only publishers whose virtual group matches the topic."""
+        """Handle subscriber lookup request and properly handle broker groups in viaBroker mode."""
         self.logger.info(f"Lookup request for topics: {lookup_req.topiclist}")
 
         if not self.quorum_met():
@@ -406,28 +434,44 @@ class DiscoveryAppln:
 
         matched_nodes = []
         if self.dissemination_strategy == "Direct":
-            path = "/publishers"
-            self.logger.info("Direct mode: Looking up publishers")
+            # Direct mode: Find publishers that handle the requested topics
+            self._lookup_direct_publishers(lookup_req.topiclist, matched_nodes)
         else:
-            path = "/brokers"
-            self.logger.info("ViaBroker mode: Looking up brokers")
+            # ViaBroker mode: Find appropriate brokers, accounting for group structure
+            self._lookup_brokers_with_group_structure(lookup_req.topiclist, matched_nodes)
 
-        # For each topic requested, compute expected virtual group and log it.
-        for topic in lookup_req.topiclist:
+        response = discovery_pb2.DiscoveryResp()
+        response.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
+        response.lookup_resp.publishers.extend(matched_nodes)
+        self.logger.info(f"Returning {len(matched_nodes)} matches for topics {lookup_req.topiclist}")
+        return response
+        
+    def _lookup_direct_publishers(self, topics, matched_nodes):
+        """Find publishers that match the requested topics."""
+        path = "/publishers"
+        self.logger.info("Direct mode: Looking up publishers")
+        
+        # For each topic requested, compute expected virtual group
+        topic_to_group = {}
+        for topic in topics:
             expected_group = consistent_hash(topic) % self.num_virtual_groups
+            topic_to_group[topic] = expected_group
             self.logger.info(f"Subscriber lookup: For topic '{topic}' expected virtual group is {expected_group}")
 
         try:
             if self.zk.exists(path):
                 nodes = self.zk.get_children(path)
                 self.logger.info(f"Found {len(nodes)} nodes in ZooKeeper under {path}")
+                
                 for node_id in nodes:
                     if node_id in ["leader", "replicas", "spawn_lock"]:
                         self.logger.warning(f"Skipping system node '{node_id}' in {path}")
                         continue
+                        
                     try:
                         data, _ = self.zk.get(f"{path}/{node_id}")
                         node_data = data.decode()
+                        
                         if "|" in node_data:
                             # Data format: "addr:port|topic1:group1,topic2:group2,..."
                             addr_port, mapping_str = node_data.split("|")
@@ -435,18 +479,20 @@ class DiscoveryAppln:
                             if len(addr_parts) != 2:
                                 self.logger.error(f"Invalid address format in node {node_id}: {addr_port}")
                                 continue
+                                
                             addr = addr_parts[0]
                             port = int(addr_parts[1])
-                            # Build a mapping dictionary.
+                            
+                            # Build a mapping dictionary
                             mapping = {}
                             for pair in mapping_str.split(","):
                                 if ":" in pair:
-                                    topic, grp = pair.split(":")
-                                    mapping[topic] = int(grp)
-                            # For each topic requested by the subscriber,
-                            # compute the expected group and if it matches, add the publisher.
-                            for topic in lookup_req.topiclist:
-                                expected_group = consistent_hash(topic) % self.num_virtual_groups
+                                    topic_name, grp = pair.split(":")
+                                    mapping[topic_name] = int(grp)
+                                    
+                            # Match publisher to topics based on group
+                            for topic in topics:
+                                expected_group = topic_to_group[topic]
                                 if topic in mapping and mapping[topic] == expected_group:
                                     node_info = discovery_pb2.RegistrantInfo(
                                         id=f"{node_id}:grp={mapping[topic]}",
@@ -455,9 +501,10 @@ class DiscoveryAppln:
                                     )
                                     matched_nodes.append(node_info)
                                     self.logger.info(f"Added publisher {node_id} (group {mapping[topic]}) for topic '{topic}'")
-                                    break  # Only add publisher once even if it serves multiple topics.
+                                    break  # Only add publisher once even if it serves multiple topics
+                                    
                         else:
-                            # If no virtual group mapping is present, fall back to original format.
+                            # If no virtual group mapping is present, fall back to original format
                             if ":" in node_data:
                                 addr, port = node_data.split(":")
                                 node_info = discovery_pb2.RegistrantInfo(id=node_id, addr=addr, port=int(port))
@@ -465,18 +512,205 @@ class DiscoveryAppln:
                                 self.logger.info(f"Added {node_id} at {addr}:{port} to response")
                             else:
                                 self.logger.error(f"Node {node_id} has invalid data format: {node_data}")
+                                
                     except Exception as e:
                         self.logger.error(f"Error retrieving node {node_id}: {str(e)}")
             else:
                 self.logger.warning(f"Path {path} does not exist in ZooKeeper")
+                
         except Exception as e:
-            self.logger.error(f"Error during lookup: {str(e)}")
+            self.logger.error(f"Error during publisher lookup: {str(e)}")
+            
+    def _lookup_brokers_with_group_structure(self, topics, matched_nodes):
+        """Find appropriate brokers using the group structure, with fallback to flat structure."""
+        broker_base_path = "/brokers"
+        self.logger.info("ViaBroker mode: Looking up brokers in group structure")
+        self.logger.info(f"DEBUG: Broker base path is {broker_base_path}")
 
-        response = discovery_pb2.DiscoveryResp()
-        response.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
-        response.lookup_resp.publishers.extend(matched_nodes)
-        self.logger.info(f"Returning {len(matched_nodes)} matches for topics {lookup_req.topiclist}")
-        return response
+        # For each topic requested, compute expected virtual group
+        topic_to_group = {}
+        for topic in topics:
+            expected_group = consistent_hash(topic) % self.num_virtual_groups
+            topic_to_group[topic] = expected_group
+            self.logger.info(f"Broker lookup: Topic '{topic}' maps to virtual group {expected_group}")
+
+        try:
+            # Check if base path exists
+            if not self.zk.exists(broker_base_path):
+                self.logger.warning(f"DEBUG: Broker path {broker_base_path} does not exist in ZooKeeper. Cannot find brokers.")
+                return
+
+            # Get all children under /brokers
+            children = self.zk.get_children(broker_base_path)
+            if not children:
+                self.logger.warning(f"DEBUG: No children found under {broker_base_path}")
+                return
+
+            self.logger.info(f"DEBUG: Found children under /brokers: {children}")
+
+            # Separate groups from potential flat broker nodes
+            groups = [child for child in children if child.startswith("group")]
+            flat_brokers = [child for child in children if not child.startswith("group") and child not in ["leader", "replicas", "spawn_lock"]]
+
+            self.logger.info(f"DEBUG: Identified groups: {groups}")
+            self.logger.info(f"DEBUG: Identified potential flat brokers: {flat_brokers}")
+
+            # Dump entire ZooKeeper structure for debugging
+            self.logger.info("DEBUG: Current ZooKeeper broker structure:")
+            self.dump_zk_path(broker_base_path)
+
+            # --- Primary Strategy: Look for group leaders ---
+            self.logger.info("DEBUG: Attempting lookup via group structure...")
+            found_in_groups = False
+            for topic in topics:
+                expected_group = topic_to_group[topic]
+                group_name = f"group{expected_group}"
+                self.logger.info(f"DEBUG: Looking for group {group_name} for topic {topic}")
+
+                # Check if this group exists
+                if group_name in groups:
+                    self.logger.info(f"DEBUG: Found matching group {group_name}")
+                    # Look for leader in this group
+                    leader_path = f"{broker_base_path}/{group_name}/leader"
+                    self.logger.info(f"DEBUG: Checking for leader at {leader_path}")
+
+                    if self.zk.exists(leader_path):
+                        self.logger.info(f"DEBUG: Leader exists at {leader_path}")
+                        data, _ = self.zk.get(leader_path)
+                        broker_info = data.decode()
+                        self.logger.info(f"DEBUG: Leader data: {broker_info}")
+
+                        # Handle format with lease expiry
+                        if "|" in broker_info:
+                            broker_info = broker_info.split("|")[0]
+
+                        if ":" in broker_info:
+                            addr, port_str = broker_info.split(":")
+                            try:
+                                port = int(port_str)
+                                # Create broker info with the group ID attached
+                                node_info = discovery_pb2.RegistrantInfo(
+                                    id=f"broker_{group_name}:grp={expected_group}",
+                                    addr=addr,
+                                    port=port
+                                )
+
+                                # Check if we've already added this broker
+                                already_added = any(node.addr == addr and node.port == port for node in matched_nodes)
+
+                                if not already_added:
+                                    matched_nodes.append(node_info)
+                                    self.logger.info(f"DEBUG: Added broker {addr}:{port} from group {group_name} for topic '{topic}'")
+                                    found_in_groups = True
+                                else:
+                                     self.logger.info(f"DEBUG: Broker {addr}:{port} from group {group_name} already added.")
+
+                            except ValueError:
+                                self.logger.error(f"DEBUG: Invalid port number in leader data: {port_str}")
+                        else:
+                            self.logger.error(f"DEBUG: Invalid format for leader data: {broker_info}")
+                    else:
+                        self.logger.info(f"DEBUG: No leader found at {leader_path}")
+                else:
+                    self.logger.info(f"DEBUG: Group {group_name} not found in available groups {groups}")
+
+            # --- Fallback Strategy: Use flat broker nodes if no group leaders were found ---
+            if not found_in_groups and flat_brokers:
+                self.logger.info("DEBUG: No specific group leaders found or matched. Falling back to flat broker nodes.")
+                for broker_id in flat_brokers:
+                    broker_path = f"{broker_base_path}/{broker_id}"
+                    try:
+                        if self.zk.exists(broker_path):
+                            data, _ = self.zk.get(broker_path)
+                            broker_info = data.decode()
+                            self.logger.info(f"DEBUG: Checking flat broker {broker_id} with data: {broker_info}")
+                            if ":" in broker_info:
+                                # Handle potential extra data like topic mapping
+                                addr_port = broker_info.split("|")[0]
+                                addr, port_str = addr_port.split(":")
+                                try:
+                                    port = int(port_str)
+                                    node_info = discovery_pb2.RegistrantInfo(
+                                        id=broker_id,
+                                        addr=addr,
+                                        port=port
+                                    )
+                                    # Check if already added
+                                    already_added = any(node.addr == addr and node.port == port for node in matched_nodes)
+                                    if not already_added:
+                                        matched_nodes.append(node_info)
+                                        self.logger.info(f"DEBUG: Added flat broker {broker_id} at {addr}:{port} as fallback")
+                                        # In fallback, often adding one is enough, but let's add all found flat ones
+                                except ValueError:
+                                     self.logger.error(f"DEBUG: Invalid port number in flat broker data: {port_str}")
+                            else:
+                                self.logger.error(f"DEBUG: Invalid format for flat broker data: {broker_info}")
+                    except Exception as e:
+                        self.logger.error(f"DEBUG: Error processing flat broker {broker_id}: {str(e)}")
+
+            # --- Final Fallback: Use *any* group leader if still nothing found ---
+            if not matched_nodes and groups:
+                 self.logger.info("DEBUG: Still no brokers found. Falling back to *any* available group leader.")
+                 for group_name in groups:
+                    leader_path = f"{broker_base_path}/{group_name}/leader"
+                    self.logger.info(f"DEBUG: Checking final fallback leader at {leader_path}")
+                    if self.zk.exists(leader_path):
+                        self.logger.info(f"DEBUG: Final fallback leader exists at {leader_path}")
+                        data, _ = self.zk.get(leader_path)
+                        broker_info = data.decode()
+                        self.logger.info(f"DEBUG: Final fallback leader data: {broker_info}")
+
+                        if "|" in broker_info: broker_info = broker_info.split("|")[0]
+
+                        if ":" in broker_info:
+                            addr, port_str = broker_info.split(":")
+                            try:
+                                port = int(port_str)
+                                node_info = discovery_pb2.RegistrantInfo(
+                                    id=f"broker_{group_name}_fallback",
+                                    addr=addr,
+                                    port=port
+                                )
+                                # Check if already added
+                                already_added = any(node.addr == addr and node.port == port for node in matched_nodes)
+                                if not already_added:
+                                    matched_nodes.append(node_info)
+                                    self.logger.info(f"DEBUG: Added broker from group {group_name} as final fallback")
+                                    break # Found one, that's enough for final fallback
+                            except ValueError:
+                                self.logger.error(f"DEBUG: Invalid port number in final fallback leader data: {port_str}")
+                        else:
+                            self.logger.error(f"DEBUG: Invalid format for final fallback leader data: {broker_info}")
+                    else:
+                        self.logger.info(f"DEBUG: No final fallback leader found at {leader_path}")
+
+
+        except Exception as e:
+            self.logger.error(f"DEBUG: Error during broker lookup: {str(e)}")
+            # Log the stack trace for detailed debugging
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+        # Final check
+        if not matched_nodes:
+             self.logger.error("DEBUG: After all attempts, no brokers were found to return.")
+            
+    def dump_zk_path(self, path, level=0):
+        """Debug method to dump a specific ZooKeeper path structure."""
+        try:
+            children = self.zk.get_children(path)
+            for child in children:
+                child_path = f"{path}/{child}"
+                data = None
+                try:
+                    data_bytes, _ = self.zk.get(child_path)
+                    data = data_bytes.decode() if data_bytes else None
+                except Exception:
+                    pass
+                self.logger.info(f"{'  ' * level}|- {child} {f'({data})' if data else ''}")
+                self.dump_zk_path(child_path, level + 1)
+        except Exception as e:
+            self.logger.error(f"Error dumping path {path}: {str(e)}")
 
     ########################################
     # Run the Discovery Service

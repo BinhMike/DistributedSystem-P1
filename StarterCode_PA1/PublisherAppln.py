@@ -40,6 +40,16 @@ class PublisherAppln:
         self.logger = logger
         self.zk = None
         self.discovery_addr = None
+        
+        # ZooKeeper paths
+        self.zk_paths = {
+            "discovery_leader": "/discovery/leader",
+            "discovery_replicas": "/discovery/replicas",
+            "publishers": "/publishers",
+            "brokers": "/brokers",
+            "subscribers": "/subscribers",
+            "load_balancers": "/load_balancers"
+        }
 
     def configure(self, args):
         try:
@@ -59,24 +69,68 @@ class PublisherAppln:
             self.logger.info("Connecting to ZooKeeper at {}".format(args.zookeeper))
             self.zk = KazooClient(hosts=args.zookeeper)
             self.zk.start()
-            self.zk.DataWatch("/discovery/leader", self.update_discovery_info)
+            
+            # Create initial ZooKeeper structure if needed
+            self._ensure_zk_paths_exist()
+            
+            # Watch for discovery leader changes
+            self.zk.DataWatch(self.zk_paths["discovery_leader"], self.update_discovery_info)
 
             self.logger.info("Waiting for Discovery address from ZooKeeper...")
-            while self.discovery_addr is None:
-                time.sleep(2)
+            self._wait_for_discovery()
 
             self.logger.debug("PublisherAppln::configure - initializing middleware")
             self.mw_obj = PublisherMW(self.logger)
-            self.mw_obj.configure(self.discovery_addr, args.port, args.addr)
+            self.mw_obj.configure(self.discovery_addr, args.port, args.addr, self.zk)
             self.logger.info("PublisherAppln::configure - configuration complete")
 
         except Exception as e:
             raise e
+            
+    def _ensure_zk_paths_exist(self):
+        """Ensure base ZooKeeper paths exist"""
+        try:
+            # Create all necessary base paths
+            for path in self.zk_paths.values():
+                if not self.zk.exists(path):
+                    self.zk.ensure_path(path)
+                    self.logger.info(f"Created ZooKeeper path: {path}")
+        except Exception as e:
+            self.logger.error(f"Error creating ZooKeeper paths: {str(e)}")
+            
+    def _wait_for_discovery(self):
+        """Wait until a discovery service address is available"""
+        max_attempts = 30
+        attempts = 0
+        
+        while self.discovery_addr is None and attempts < max_attempts:
+            attempts += 1
+            self.logger.info(f"Waiting for Discovery service address... (attempt {attempts}/{max_attempts})")
+            # Check if leader node exists directly
+            if self.zk.exists(self.zk_paths["discovery_leader"]):
+                data, _ = self.zk.get(self.zk_paths["discovery_leader"])
+                if data:
+                    leader_info = data.decode()
+                    # Extract just the address:port part
+                    if '|' in leader_info:
+                        self.discovery_addr = leader_info.split('|')[0]
+                    else:
+                        self.discovery_addr = leader_info
+                    self.logger.info(f"Found Discovery service at: {self.discovery_addr}")
+                    break
+            time.sleep(2)
+            
+        if self.discovery_addr is None:
+            raise Exception("Could not find Discovery service after multiple attempts")
 
     def update_discovery_info(self, data, stat, event=None):
         """ Update Discovery service address if it changes """
         if data:
             new_addr = data.decode("utf-8")
+            # Extract just the address:port part if it includes expiry info
+            if '|' in new_addr:
+                new_addr = new_addr.split('|')[0]
+                
             if new_addr != self.discovery_addr:
                 self.logger.info(f"Discovery changed to {new_addr}, reconnecting...")
                 self.discovery_addr = new_addr
@@ -89,7 +143,7 @@ class PublisherAppln:
         """Wrapper to register with Discovery via middleware."""
         self.logger.info("PublisherAppln::register - re-registering with Discovery")
         self.mw_obj.register(self.name, self.topiclist)
-        
+
     def driver(self):
         try:
             self.logger.info("PublisherAppln::driver")
@@ -145,13 +199,79 @@ class PublisherAppln:
             raise e
 
     def register_response(self, reg_resp):
-        if reg_resp.status == discovery_pb2.STATUS_SUCCESS:
+        if reg_resp.status == discovery_pb2.Status.STATUS_SUCCESS:
             self.logger.info("PublisherAppln::register_response - Registration successful")
+            
+            # Check if we received group mapping info in the reason field
+            if hasattr(reg_resp, "reason") and reg_resp.reason:
+                try:
+                    group_mapping = {}
+                    mapping_str = reg_resp.reason
+                    self.logger.info(f"Received group mapping in reason field: {mapping_str}")
+                    
+                    # Parse the mapping string
+                    for pair in mapping_str.split(","):
+                        if ":" in pair:
+                            topic, group = pair.split(":")
+                            group_mapping[topic] = int(group)
+                            
+                    # Update middleware with group mapping
+                    if group_mapping and self.mw_obj:
+                        self.mw_obj.update_group_mapping(group_mapping)
+                except Exception as e:
+                    self.logger.error(f"Error processing group mapping: {e}")
+            
+            # Move to dissemination state
             self.state = self.State.DISSEMINATE
             return 0
+        else:
+            # Check if it's not primary based on reason field instead of status code
+            if hasattr(reg_resp, "reason") and reg_resp.reason and "primary" in reg_resp.reason.lower():
+                self.logger.warning(f"Not connected to primary Discovery: {reg_resp.reason}")
+                self._locate_primary_discovery()
+                return 1000  # Retry after a delay
+            else:
+                self.logger.error(f"Registration failed with status: {reg_resp.status}, reason: {reg_resp.reason}")
+                return 5000  # Longer retry for other failures
+
+    def _locate_primary_discovery(self):
+        """Attempt to directly find primary discovery through ZooKeeper"""
+        try:
+            # Read leader node again
+            if self.zk.exists(self.zk_paths["discovery_leader"]):
+                data, _ = self.zk.get(self.zk_paths["discovery_leader"])
+                if data:
+                    new_addr = data.decode().split('|')[0]  # Extract address from "addr:port|expiry"
+                    if new_addr != self.discovery_addr:
+                        self.discovery_addr = new_addr
+                        self.logger.info(f"Found primary Discovery at: {self.discovery_addr}")
+                        self.mw_obj.connect_to_discovery(self.discovery_addr)
+                        self.register()
+                    else:
+                        self.logger.warning("Already connected to the leader address. Waiting for leader state to stabilize.")
+        except Exception as e:
+            self.logger.error(f"Error locating primary: {str(e)}")
 
     def dump(self):
         self.logger.info(f"PublisherAppln:: Name: {self.name}, Topics: {self.topiclist}")
+        
+    def cleanup(self):
+        """Clean up resources"""
+        try:
+            self.logger.info("PublisherAppln::cleanup")
+            
+            # Clean up middleware
+            if self.mw_obj:
+                self.mw_obj.cleanup()
+                
+            # Close ZooKeeper connection
+            if self.zk:
+                self.zk.stop()
+                self.zk.close()
+                
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {str(e)}")
+
 
 def parseCmdLineArgs():
     parser = argparse.ArgumentParser(description="Publisher Application")
@@ -162,9 +282,10 @@ def parseCmdLineArgs():
     parser.add_argument("-f", "--frequency", type=int, default=1, help="Dissemination frequency")
     parser.add_argument("-i", "--iters", type=int, default=1000, help="Number of iterations")
     parser.add_argument("-z", "--zookeeper", default="localhost:2181", help="ZooKeeper Address")
-    parser.add_argument("-c", "--config", default="config.ini", help="Configuration file (default: config.ini)")  # ✅ Add this line
-    parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, help="Logging level")
+    parser.add_argument("-c", "--config", default="config.ini", help="Configuration file (default: config.ini)")
+    parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, help="Logging level, DEBUG=10, INFO=20, WARNING=30, ERROR=40, CRITICAL=50")
     return parser.parse_args()
+
 
 def main():
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -174,6 +295,7 @@ def main():
     app = PublisherAppln(logger)
     app.configure(args)
     app.driver()
+
 
 if __name__ == "__main__":
     main()

@@ -130,6 +130,12 @@ class BrokerMW():
                     if self.zk.exists(pub_node_path):
                         pub_data, _ = self.zk.get(pub_node_path)
                         pub_address = pub_data.decode()
+                        
+                        # Extract just the address part if there's topic mapping data
+                        if "|" in pub_address:
+                            pub_address = pub_address.split("|")[0]
+                            self.logger.info(f"BrokerMW::subscribe_to_publishers - Extracted address {pub_address} from publisher data")
+                        
                         connection_url = f"tcp://{pub_address}"
                         self.sub.connect(connection_url)
                         self.logger.info(f"BrokerMW::subscribe_to_publishers - Connected to Publisher {pub_id} at {connection_url}")
@@ -160,8 +166,15 @@ class BrokerMW():
                         if self.zk.exists(pub_node_path):
                             pub_data, _ = self.zk.get(pub_node_path)
                             pub_address = pub_data.decode()
-                            new_sub.connect(f"tcp://{pub_address}")
-                            self.logger.info(f"BrokerMW::handle_publisher_change - Connected to Publisher {pub_id} at {pub_address}")
+                            
+                            # Extract just the address part if there's topic mapping data
+                            if "|" in pub_address:
+                                pub_address = pub_address.split("|")[0]
+                                self.logger.info(f"BrokerMW::handle_publisher_change - Extracted address {pub_address} from publisher data")
+                            
+                            connection_url = f"tcp://{pub_address}"
+                            new_sub.connect(connection_url)
+                            self.logger.info(f"BrokerMW::handle_publisher_change - Connected to Publisher {pub_id} at {connection_url}")
                     except Exception as e:
                         self.logger.error(f"BrokerMW::handle_publisher_change - Error connecting to publisher {pub_id}: {str(e)}")
             
@@ -468,15 +481,35 @@ class BrokerMW():
             self.logger.info(f"BrokerMW::register - Registering broker {name}")
             self.broker_name = name  # Store the name for future use
             
-            # Create and register broker node
-            broker_path = "/brokers"
-            self.ensure_path_exists(broker_path)
+            # Create and register broker node in the group structure
+            broker_base_path = "/brokers"
+            self.ensure_path_exists(broker_base_path)
             
-            broker_node = f"{broker_path}/{name}"
+            # Extract group name from broker name or use default
+            # Convention: if broker name contains "group" substring, use that as the group
+            group_name = "default_group"
+            if "group" in name:
+                parts = name.split("group")
+                if len(parts) > 1 and parts[1]:
+                    group_name = f"group{parts[1].split('_')[0]}"
+            
+            self.logger.info(f"BrokerMW::register - Using group name: {group_name}")
+            
+            # Create group path
+            group_path = f"{broker_base_path}/{group_name}"
+            self.ensure_path_exists(group_path)
+            
+            # Ensure replicas path exists
+            replicas_path = f"{group_path}/replicas"
+            self.ensure_path_exists(replicas_path)
+            
+            # Register this broker as a replica
+            replica_node = f"{replicas_path}/{name}"
             address_str = f"{self.addr}:{self.port}"
-            self.zk_update_node(broker_node, address_str, ephemeral=True)
+            self.zk_update_node(replica_node, address_str, ephemeral=True)
+            self.logger.info(f"BrokerMW::register - Registered as replica at {replica_node}")
             
-            # Only register as a "publisher" if primary
+            # Only register as a "publisher" if primary (for discovery compatibility if needed)
             self._update_publisher_registration(self.is_primary)
             
             return True

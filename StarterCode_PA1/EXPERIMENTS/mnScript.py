@@ -4,9 +4,11 @@ from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.util import dumpNodeConnections
 from mininet.log import setLogLevel
-from mininet.nodelib import NAT
 from mininet.cli import CLI
-from mininet.node import OVSController, RemoteController, OVSKernelSwitch
+from mininet.node import OVSController, OVSKernelSwitch
+import time
+import signal
+import os
 
 
 def run():
@@ -21,118 +23,218 @@ def run():
 
     zk_path = "/opt/zookeeper/bin"
     
-    # Create hosts
+    # Create hosts with descriptive names
     print("Creating hosts")
-    h1 = net.addHost('h1') #zookeeper
-    h2 = net.addHost('h2')  
-    h3 = net.addHost('h3')  
-    h4 = net.addHost('h4')  
-    h5 = net.addHost('h5')  
-    h6 = net.addHost('h6') 
-    h7 = net.addHost('h7')  
-    h8 = net.addHost('h8')  
-    h9 = net.addHost('h9')  
-    h10 = net.addHost('h10')  
-    h11 = net.addHost('h11')  
-    h12 = net.addHost('h12')  
-    h13 = net.addHost('h13') 
-    h14 = net.addHost('h14')
-    h15 = net.addHost('h15')
-    h16 = net.addHost('h16')
-    h17 = net.addHost('h17')
-
+    zk_host = net.addHost('zk')      # ZooKeeper
+    discovery = []
+    for i in range(3):
+        discovery.append(net.addHost(f'disc{i+1}'))  # Discovery services
+    
+    lb = net.addHost('lb')          # Load balancer
+    
+    brokers_group1 = []
+    for i in range(3):
+        brokers_group1.append(net.addHost(f'brk1_{i+1}'))  # Broker group 1
+    
+    brokers_group2 = []
+    for i in range(3):
+        brokers_group2.append(net.addHost(f'brk2_{i+1}'))  # Broker group 2
+    
+    publishers = []
+    for i in range(3):
+        publishers.append(net.addHost(f'pub{i+1}'))  # Publishers
+    
+    subscribers = []
+    for i in range(3):
+        subscribers.append(net.addHost(f'sub{i+1}'))  # Subscribers
+    
+    # Monitor host (for watching and killing processes to test failover)
+    monitor = net.addHost('monitor')
+    
     # Create switch
     print("Creating switch")
     s1 = net.addSwitch('s1')
 
     # Link hosts to switch
     print("Creating links")
-    for h in [h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17]:
+    all_hosts = [zk_host] + discovery + [lb] + brokers_group1 + brokers_group2 + publishers + subscribers + [monitor]
+    for h in all_hosts:
         net.addLink(h, s1)
 
     print("Starting network")
     net.start()
     
-    # Extended network testing
-    print("Network interfaces on h1:")
-    print(h1.cmd('ifconfig'))
-    
-    print("Network interfaces on h2:")
-    print(h2.cmd('ifconfig'))
-    
-    print("Switch flow tables:")
-    print(s1.cmd('ovs-ofctl dump-flows s1'))
-    # Get IPs (after connectivity verification)
-    zookeeper_ip = h1.IP()
-    h2_ip = h2.IP()
-    h3_ip = h3.IP()
-    h4_ip = h4.IP()
-    h5_ip = h5.IP()
-    h6_ip = h6.IP()
-    h7_ip = h7.IP()
-    h8_ip = h8.IP()
-    h9_ip = h9.IP()
-    h10_ip = h10.IP()
-    h11_ip = h11.IP()
-    h12_ip = h12.IP()
-    h13_ip = h13.IP()
-    h14_ip = h14.IP()
-    h15_ip = h15.IP()
-    h16_ip = h16.IP()
-    h17_ip = h17.IP()
+    # Get IPs for all hosts
+    zk_ip = zk_host.IP()
+    discovery_ips = [h.IP() for h in discovery]
+    lb_ip = lb.IP()
+    broker1_ips = [h.IP() for h in brokers_group1]
+    broker2_ips = [h.IP() for h in brokers_group2]
+    publisher_ips = [h.IP() for h in publishers]
+    subscriber_ips = [h.IP() for h in subscribers]
+    monitor_ip = monitor.IP()
 
+    # Print IP addresses for reference
+    print("\n=== Network IP Addresses ===")
+    print(f"ZooKeeper: {zk_ip}")
+    print(f"Discovery Services: {', '.join(discovery_ips)}")
+    print(f"Load Balancer: {lb_ip}")
+    print(f"Broker Group 1: {', '.join(broker1_ips)}")
+    print(f"Broker Group 2: {', '.join(broker2_ips)}")
+    print(f"Publishers: {', '.join(publisher_ips)}")
+    print(f"Subscribers: {', '.join(subscriber_ips)}")
+    print(f"Monitor: {monitor_ip}\n")
     
     # Configure ZooKeeper
-    h1.cmd(f"echo 'clientPortAddress={zookeeper_ip}' > /tmp/zoo.cfg")
-    h1.cmd(f"echo 'dataDir=/tmp/zookeeper' >> /tmp/zoo.cfg")
-    h1.cmd(f"echo 'clientPort=2181' >> /tmp/zoo.cfg")
-    h1.cmd(f"mkdir -p /tmp/zookeeper")
+    zk_host.cmd(f"echo 'clientPortAddress={zk_ip}' > /tmp/zoo.cfg")
+    zk_host.cmd(f"echo 'dataDir=/tmp/zookeeper' >> /tmp/zoo.cfg")
+    zk_host.cmd(f"echo 'clientPort=2181' >> /tmp/zoo.cfg")
+    # Ensure a fresh ZooKeeper data directory
+    zk_host.cmd(f"rm -rf /tmp/zookeeper") 
+    zk_host.cmd(f"mkdir -p /tmp/zookeeper")
 
     # Stop any running ZooKeeper instance
-    h1.cmd(f'{zk_path}/zkServer.sh stop')
+    zk_host.cmd(f'{zk_path}/zkServer.sh stop')
 
-    # Start ZooKeeper with the custom config
-    h1.cmd(f'{zk_path}/zkServer.sh start-foreground /tmp/zoo.cfg &')
-    h1.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e {zk_path}/zkCli.sh &')
+    # Start ZooKeeper in a separate terminal with distinctive title
+    zk_host.cmd(f'xterm -T "ZooKeeper Server" -fa "Monospace" -fs 12 -geometry 100x30 -bg black -fg green -e "{zk_path}/zkServer.sh start-foreground /tmp/zoo.cfg" &')
+    
+    # ZooKeeper client for monitoring - explicitly specify the server IP
+    zk_host.cmd(f'xterm -T "ZooKeeper Client ({zk_ip})" -fa "Monospace" -fs 12 -geometry 100x30 -bg black -fg yellow -e "{zk_path}/zkCli.sh -server {zk_ip}:2181" &')
 
-    # Wait longer for ZooKeeper to initialize
-    import time
+    print("\nWaiting for ZooKeeper to initialize...")
     time.sleep(10)
     
-    # Start Discovery Services
-    h2.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 DiscoveryAppln.py -p 5555 -a {h2_ip} -z {zookeeper_ip}:2181" &')
-    h3.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 DiscoveryAppln.py -p 5556 -a {h3_ip} -z {zookeeper_ip}:2181" &')
-    h4.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 DiscoveryAppln.py -p 5557 -a {h4_ip} -z {zookeeper_ip}:2181" &')
+    # Start Discovery Services - color coded with blue background
+    print("\nStarting Discovery Services...")
+    for i, (disc, ip) in enumerate(zip(discovery, discovery_ips)):
+        port = 5555 + i
+        title = f"Discovery {i+1} ({ip}:{port})"
+        disc.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg blue -fg white -hold -e "python3 DiscoveryAppln.py -p {port} -a {ip} -z {zk_ip}:2181 -l 20" &')
+        time.sleep(1)  # Stagger the starts
 
-    # Start Broker Load Balancer (now on h5)
-    h5.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerLB.py --addr {h5_ip} -z {zookeeper_ip}:2181" &')
+    # Start Broker Load Balancer - purple background
+    print("\nStarting Broker Load Balancer...")
+    title = f"Load Balancer ({lb_ip})"
+    lb.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg purple -fg white -hold -e "python3 BrokerLB.py --addr {lb_ip} -z {zk_ip}:2181 -l 20" &')
+    time.sleep(2)
 
-    # Start Brokers - Group 1 
-    h6.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker1 -p 6000 --addr {h6_ip} -z {zookeeper_ip}:2181 -g group1" &')
-    h7.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker2 -p 6001 --addr {h7_ip} -z {zookeeper_ip}:2181 -g group1" &')
-    h8.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker3 -p 6002 --addr {h8_ip} -z {zookeeper_ip}:2181 -g group1" &')
+    # Start Brokers Group 1 - red background
+    print("\nStarting Broker Group 1...")
+    for i, (broker, ip) in enumerate(zip(brokers_group1, broker1_ips)):
+        port = 6000 + i
+        title = f"Broker Group 1-{i+1} ({ip}:{port})"
+        broker.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg red -fg white -hold -e "python3 BrokerAppln.py -n broker1_{i+1} -p {port} --addr {ip} -z {zk_ip}:2181 -g group1 -l 20" &')
+        time.sleep(2)  # Give each broker time to initialize
 
-    # Start Brokers - Group 2 
-    h9.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker4 -p 6000 --addr {h9_ip} -z {zookeeper_ip}:2181 -g group2" &')
-    h10.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker5 -p 6001 --addr {h10_ip} -z {zookeeper_ip}:2181 -g group2" &')
-    h11.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 BrokerAppln.py -n broker6 -p 6002 --addr {h11_ip} -z {zookeeper_ip}:2181 -g group2" &')
+    # Start Brokers Group 2 - orange background
+    print("\nStarting Broker Group 2...")
+    for i, (broker, ip) in enumerate(zip(brokers_group2, broker2_ips)):
+        port = 6000 + i
+        title = f"Broker Group 2-{i+1} ({ip}:{port})"
+        broker.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg orange -fg black -hold -e "python3 BrokerAppln.py -n broker2_{i+1} -p {port} --addr {ip} -z {zk_ip}:2181 -g group2 -l 20" &')
+        time.sleep(2)  # Give each broker time to initialize
 
-    # Start Publishers (using h12, h13, h14)
-    h12.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 PublisherAppln.py -n pub1 -a {h12_ip} -p 5577 -z {zookeeper_ip}:2181 -T 2 -f 1 -i 1000 -l 20" &')
-    h13.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 PublisherAppln.py -n pub2 -a {h13_ip} -p 5578 -z {zookeeper_ip}:2181 -T 2 -f 1 -i 1000 -l 20" &')
-    h14.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 PublisherAppln.py -n pub3 -a {h14_ip} -p 5579 -z {zookeeper_ip}:2181 -T 2 -f 1 -i 1000 -l 20" &')
+    # Wait for brokers to fully initialize and elect leaders
+    print("\nWaiting for broker initialization and leader election...")
+    time.sleep(15)
 
-    # Start Subscribers (using h15, h16)
-    h15.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 SubscriberAppln.py -n sub1 -z {zookeeper_ip}:2181 -T 9 -l 20" &')
-    h16.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 SubscriberAppln.py -n sub2 -z {zookeeper_ip}:2181 -T 9 -l 20" &')
-    h17.cmd(f'xterm -fa "Monospace" -fs 12 -geometry 100x30 -hold -e "python3 SubscriberAppln.py -n sub3 -z {zookeeper_ip}:2181 -T 9 -l 20" &')
+    # Start Publishers - green background
+    print("\nStarting Publishers...")
+    for i, (pub, ip) in enumerate(zip(publishers, publisher_ips)):
+        port = 5577 + i
+        title = f"Publisher {i+1} ({ip}:{port})"
+        pub.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg green -fg black -hold -e "python3 PublisherAppln.py -n pub{i+1} -a {ip} -p {port} -z {zk_ip}:2181 -T 2 -f 1 -i 1000 -l 20" &')
+        time.sleep(2)
 
-    print("Dumping host connections")
-    dumpNodeConnections(net.hosts)
+    # Start Subscribers - cyan background
+    print("\nStarting Subscribers...")
+    for i, (sub, ip) in enumerate(zip(subscribers, subscriber_ips)):
+        title = f"Subscriber {i+1} ({ip})"
+        sub.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg cyan -fg black -hold -e "python3 SubscriberAppln.py -n sub{i+1} -z {zk_ip}:2181 -T 9 -l 20" &')
+        time.sleep(2)
+
+    # Set up monitor station for testing failover scenarios
+    monitor.cmd(f'xterm -T "Test Monitor Station" -fa "Monospace" -fs 12 -geometry 120x40 -bg white -fg black -hold -e "echo \'Welcome to the Test Monitor Station\n\nZooKeeper: {zk_ip}:2181\nDiscovery: {discovery_ips}\nBrokers Group 1: {broker1_ips}\nBrokers Group 2: {broker2_ips}\nPublishers: {publisher_ips}\nSubscribers: {subscriber_ips}\n\nExample commands:\n- Check broker leaders: echo stat | nc {zk_ip} 2181 | grep brokers\n- Kill primary broker: ssh {broker1_ips[0]} pkill -f BrokerAppln\n- Kill discovery leader: ssh {discovery_ips[0]} pkill -f DiscoveryAppln\n- Check status: ps -ef | grep -E \"(Broker|Discovery|Publisher|Subscriber)Appln\" | grep -v grep\n\nUse this monitor to test failover scenarios\'; bash" &')
+
+    print("\n===== NETWORK IS READY =====")
+    print("Color coding:")
+    print("  - ZooKeeper: Green text")
+    print("  - Discovery Services: Blue background")
+    print("  - Load Balancer: Purple background")
+    print("  - Broker Group 1: Red background")
+    print("  - Broker Group 2: Orange background")  
+    print("  - Publishers: Green background")
+    print("  - Subscribers: Cyan background")
+    print("  - Test Monitor: White background (use for testing failover)")
     
-    print("\n===== NETWORK SHOULD BE READY =====")
-    print("Starting Mininet CLI. Try testing connectivity with 'h1 ping h2'")
+    print("\nTEST SCENARIOS TO TRY:")
+    print("1. Verify that publishers are publishing and subscribers are receiving messages")
+    print("2. Kill the primary broker in Group 1 and verify failover")
+    print("3. Kill the discovery leader and verify that a new leader is elected")
+    print("4. Kill two brokers in a group and verify quorum-based auto-spawning of new replicas")
+    print("\nStarting Mininet CLI. Try commands like 'zk ip', 'brk1_1 ip', 'monitor ip'")
     CLI(net)
+    
+    # Cleanup process
+    print("\nShutting down the test environment...")
+    
+    # Define process kill procedure with improved cleanup
+    def cleanup_processes():
+        # Define hosts to clean up
+        hosts_to_clean = all_hosts
+        
+        print("Killing all application processes...")
+        
+        # First, try a graceful shutdown with SIGINT and a short timeout
+        for host in hosts_to_clean:
+            # Use specific patterns to target exact processes
+            host.cmd("pkill -INT -f '[D]iscoveryAppln'")  # The bracketed first letter prevents matching the pkill command itself
+            host.cmd("pkill -INT -f '[B]rokerAppln'")
+            host.cmd("pkill -INT -f '[B]rokerLB'")
+            host.cmd("pkill -INT -f '[P]ublisherAppln'")
+            host.cmd("pkill -INT -f '[S]ubscriberAppln'")
+        
+        # Give processes a moment to shut down gracefully
+        print("Waiting for processes to shut down gracefully...")
+        time.sleep(3)
+        
+        # Now forcefully kill any remaining processes
+        for host in hosts_to_clean:
+            # Force kill any remaining Python processes
+            host.cmd("pkill -9 -f '[Pp]ython3 .*DiscoveryAppln'")
+            host.cmd("pkill -9 -f '[Pp]ython3 .*BrokerAppln'")
+            host.cmd("pkill -9 -f '[Pp]ython3 .*BrokerLB'")
+            host.cmd("pkill -9 -f '[Pp]ython3 .*PublisherAppln'")
+            host.cmd("pkill -9 -f '[Pp]ython3 .*SubscriberAppln'")
+            
+            # Kill any xterm windows
+            host.cmd("pkill -9 -f 'xterm'")
+            
+        # Stop ZooKeeper with a timeout
+        print("Stopping ZooKeeper...")
+        zk_host.cmd(f"{zk_path}/zkServer.sh stop")
+        time.sleep(2)  # Give ZooKeeper time to stop
+        
+        # Force kill ZooKeeper if it's still running
+        zk_host.cmd("pkill -9 -f '[Zz]ooKeeper'")
+        
+        # Verify all processes are dead
+        for host in hosts_to_clean:
+            host.cmd("pkill -0 -f 'python3' || echo 'All Python processes stopped'")
+        
+        print("All processes terminated")
+    
+    # Run cleanup with a timeout to avoid hanging
+    import threading
+    cleanup_thread = threading.Thread(target=cleanup_processes)
+    cleanup_thread.daemon = True  # Allow the script to exit even if thread is running
+    cleanup_thread.start()
+    
+    # Wait for cleanup with a timeout
+    cleanup_thread.join(timeout=15)  # Wait up to 15 seconds for cleanup
+    if cleanup_thread.is_alive():
+        print("Warning: Cleanup taking too long, forcing exit")
     
     print("Stopping network")
     net.stop()

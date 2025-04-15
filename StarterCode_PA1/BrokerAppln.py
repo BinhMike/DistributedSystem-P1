@@ -18,6 +18,7 @@ import subprocess
 import socket
 import threading
 import zmq
+import random
 
 from kazoo.client import KazooClient
 from kazoo.recipe.lock import Lock
@@ -46,11 +47,18 @@ class BrokerAppln():
         self.name = None
         self.zk = None
         
-        # Group-specific ZooKeeper paths
+        # ZooKeeper paths for unified structure
+        self.zk_paths = {
+            "discovery_leader": "/discovery/leader",
+            "discovery_replicas": "/discovery/replicas",
+            "publishers": "/publishers",
+            "brokers": "/brokers",
+            "subscribers": "/subscribers",
+            "load_balancers": "/load_balancers"
+        }
+        
+        # Group-specific paths - will be constructed based on group name
         self.group = None  # Will store the broker group name
-        self.zk_path = "/brokers"  # Base path for all broker groups
-        # Group-specific paths will be constructed based on group name
-        # e.g., /brokers/group1/leader, /brokers/group1/replicas
         self.leader_path = None  # Will be set dynamically based on group
         self.replicas_path = None  # Will be set dynamically based on group
         
@@ -82,12 +90,11 @@ class BrokerAppln():
             # Set the broker group
             self.group = args.group
             
-            # Construct group-specific paths
-            self.leader_path = f"{self.zk_path}/{self.group}/leader"
-            self.replicas_path = f"{self.zk_path}/{self.group}/replicas"
-            
-            # Initialize ZooKeeper
+            # Ensure base paths exist in the unified structure 
             self._init_zookeeper(args.zookeeper)
+            
+            # Construct all the broker paths
+            self._setup_broker_paths()
             
             # Initialize middleware
             self._init_middleware(args)
@@ -108,6 +115,20 @@ class BrokerAppln():
         except Exception as e:
             self.logger.error(f"BrokerAppln::configure - Exception: {str(e)}")
             raise e
+            
+    def _setup_broker_paths(self):
+        """Setup all broker-related paths in the unified ZooKeeper structure."""
+        # Group-specific path under brokers
+        brokers_path = self.zk_paths["brokers"]
+        group_path = f"{brokers_path}/{self.group}"
+        self.zk.ensure_path(group_path)
+        
+        # Leader and replica paths for this group
+        self.leader_path = f"{group_path}/leader"
+        self.replicas_path = f"{group_path}/replicas"
+        self.zk.ensure_path(self.replicas_path)
+        
+        self.logger.info(f"Broker paths set up: leader={self.leader_path}, replicas={self.replicas_path}")
 
     def _init_zookeeper(self, zk_address):
         """Initialize ZooKeeper connection and create required paths."""
@@ -116,10 +137,11 @@ class BrokerAppln():
         self.zk.start()
         self.logger.info("BrokerAppln::_init_zookeeper - Connected to ZooKeeper")
         
-        # Create necessary paths for the specific group
-        self.zk.ensure_path(self.zk_path)
-        self.zk.ensure_path(f"{self.zk_path}/{self.group}")
-        self.zk.ensure_path(self.replicas_path)
+        # Create all necessary base paths in the unified structure
+        for path in self.zk_paths.values():
+            if not self.zk.exists(path):
+                self.zk.ensure_path(path)
+                self.logger.info(f"Created base ZooKeeper path: {path}")
 
     def _init_middleware(self, args):
         """Initialize the middleware component."""
@@ -139,7 +161,7 @@ class BrokerAppln():
         """Find and connect to a load balancer if available in ZooKeeper."""
         try:
             # Check if the load balancer node exists in ZooKeeper
-            lb_path = "/load_balancers"
+            lb_path = self.zk_paths["load_balancers"]
             if not self.zk.exists(lb_path):
                 self.logger.info("No load balancer path found in ZooKeeper")
                 return False
@@ -196,57 +218,173 @@ class BrokerAppln():
         leader_data = f"{self.broker_address}|{lease_expiry}"
         
         try:
+            self.logger.info(f"BrokerAppln::_attempt_leadership_election - Trying to become leader at {self.leader_path}")
+            # Create the ephemeral node with initial lease data
             self.zk.create(self.leader_path, leader_data.encode(), ephemeral=True)
+            self.logger.info(f"BrokerAppln::_attempt_leadership_election - Successfully created leader node {self.leader_path}")
+            # Proceed to become primary ONLY if creation succeeded
             self._become_primary(lease_expiry)
-            
+
         except NodeExistsError:
+            self.logger.info(f"BrokerAppln::_attempt_leadership_election - Leader node {self.leader_path} already exists.")
             self._become_backup()
-    
+        except Exception as e:
+             self.logger.error(f"BrokerAppln::_attempt_leadership_election - Error creating leader node {self.leader_path}: {str(e)}")
+             # Ensure we are definitely not primary if creation failed
+             if self.is_primary:
+                 self._relinquish_leadership() # Clean up if state is inconsistent
+             else:
+                 self.is_primary = False
+                 self.mw_obj.update_primary_status(False)
+
+
+        # Regardless of leadership status, register with Discovery service in the flat structure
+        # This ensures subscribers can find us via Discovery service lookup (optional compatibility)
+        try:
+            flat_broker_path = f"/brokers/{self.name}"
+            # Use zk_update_node logic (create or update) for the flat path
+            # Ensure mw_obj is initialized before calling its methods
+            if self.mw_obj:
+                 self.mw_obj.zk_update_node(flat_broker_path, self.broker_address, ephemeral=True)
+                 self.logger.info(f"BrokerAppln::_attempt_leadership_election - Ensured flat broker node registration at {flat_broker_path}")
+            else:
+                 self.logger.warning("BrokerAppln::_attempt_leadership_election - Middleware object not initialized, cannot register flat broker node.")
+        except Exception as e:
+            self.logger.error(f"BrokerAppln::_attempt_leadership_election - Error registering flat broker node {flat_broker_path}: {str(e)}")
+
     def _become_primary(self, lease_expiry):
         """Handle transition to primary role."""
+        # Double-check if the node still exists before fully committing to primary role
+        if not self.zk.exists(self.leader_path):
+             self.logger.warning(f"BrokerAppln::_become_primary - Leader node {self.leader_path} disappeared before primary transition completed. Aborting.")
+             self.is_primary = False
+             if self.mw_obj: self.mw_obj.update_primary_status(False)
+             # Optionally, attempt election again or become backup
+             # self._attempt_leadership_election()
+             return
+
         self.is_primary = True
         self.leader_start_time = time.time()
-        self.logger.info(f"Instance {self.broker_address} became primary with lease expiring at {lease_expiry}.")
+        self.logger.info(f"Instance {self.broker_address} became primary. Lease expires around {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(lease_expiry))}.")
+        # Pass the correct broker address for renewal data
         self.start_lease_renewal(self.broker_address)
-        self.mw_obj.update_primary_status(True)
-        
+        if self.mw_obj: self.mw_obj.update_primary_status(True)
+
     def _become_backup(self):
         """Handle backup role and watch for leader changes."""
-        self.is_primary = False
-        self.logger.info("A leader already exists. Running as backup.")
-        
-        @self.zk.DataWatch(self.leader_path)
-        def watch_leader(data, stat, event):
-            if event is not None and event.type == "DELETED":
-                self._handle_leader_deletion()
-    
+        # Ensure we are not marked as primary
+        if self.is_primary:
+             self.logger.warning("BrokerAppln::_become_backup - Was marked as primary, correcting status.")
+             self.is_primary = False
+             if self.mw_obj: self.mw_obj.update_primary_status(False)
+             # Stop lease renewal if it was running
+             # (Need a way to signal the thread to stop, or just let it exit on next check)
+
+        self.logger.info(f"Instance {self.broker_address} running as backup for group {self.group}. Watching {self.leader_path}.")
+
+        # Setup the watch only if the leader path exists
+        if self.zk.exists(self.leader_path):
+            @self.zk.DataWatch(self.leader_path)
+            def watch_leader(data, stat, event):
+                # Check if the node was deleted
+                if event is not None and event.type == "DELETED":
+                    self._handle_leader_deletion()
+                # Optionally handle data changes if needed (e.g., primary changed address)
+                # elif event is not None and event.type == "CHANGED":
+                #    self.logger.info(f"Leader data changed: {data}")
+        else:
+            # If leader path doesn't exist when becoming backup, attempt election immediately
+            self.logger.warning(f"Leader path {self.leader_path} does not exist while becoming backup. Attempting election.")
+            self._attempt_leadership_election()
+
+
     def _handle_leader_deletion(self):
         """Handle the situation when the leader znode is deleted."""
-        self.logger.info("Leader znode deleted. Attempting to become primary...")
-        time.sleep(1)  # Brief pause to reduce race conditions
-        
+        self.logger.info(f"Detected deletion of leader node {self.leader_path}. Attempting to become primary...")
+        # Short delay to potentially avoid thundering herd
+        time.sleep(random.uniform(0.1, 0.5))
+
         try:
-            self.zk.ensure_path(self.zk_path)
-            
-            if not self.zk.exists(self.leader_path):
-                new_expiry = time.time() + self.lease_duration
-                new_data = f"{self.broker_address}|{new_expiry}"
-                self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
-                self._become_primary(new_expiry)
-                
-            else:
-                self.logger.info("Leader node already recreated by another instance.")
-                self.is_primary = False
-                self.mw_obj.update_primary_status(False)
-                
+            # Ensure the parent path structure exists (should generally exist)
+            parent_path = self.leader_path.rsplit('/', 1)[0]
+            self.zk.ensure_path(parent_path)
+
+            # Attempt to create the node again
+            new_expiry = time.time() + self.lease_duration
+            new_data = f"{self.broker_address}|{new_expiry}"
+            self.logger.info(f"Attempting to recreate leader node {self.leader_path}")
+            self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
+            self.logger.info(f"Successfully recreated leader node {self.leader_path}")
+            # Transition to primary
+            self._become_primary(new_expiry)
+
         except NodeExistsError:
-            self.logger.info("Another instance became primary while we were trying.")
-            self.is_primary = False
-            self.mw_obj.update_primary_status(False)
+            # Node was recreated by someone else while we waited/tried
+            self.logger.info(f"Leader node {self.leader_path} already recreated by another instance. Becoming backup.")
+            self._become_backup() # Transition to backup state properly
+
         except Exception as e:
-            self.logger.error(f"Error during leadership transition: {str(e)}")
-            self.is_primary = False
-            self.mw_obj.update_primary_status(False)
+            self.logger.error(f"Error during leadership transition after deletion of {self.leader_path}: {str(e)}")
+            # Ensure we are backup if anything goes wrong
+            self._become_backup()
+
+
+    def _renew_lease(self, broker_addr_port): # Changed parameter name for clarity
+        """Renew the leadership lease."""
+        # Ensure we are still supposed to be primary before renewing
+        if not self.is_primary:
+            self.logger.warning("Attempted to renew lease while not primary. Stopping renewal thread.")
+            # Signal the thread to stop (or let it exit naturally)
+            return # Exit the renewal loop
+
+        new_expiry = time.time() + self.lease_duration
+        new_data = f"{broker_addr_port}|{new_expiry}"
+        try:
+            # Check if node still exists before setting
+            if self.zk.exists(self.leader_path):
+                self.zk.set(self.leader_path, new_data.encode())
+                self.logger.info(f"Lease renewed for {self.leader_path}; new expiry ~{time.strftime('%H:%M:%S', time.localtime(new_expiry))}")
+            else:
+                # Node disappeared unexpectedly (e.g., ZK issue, manual deletion)
+                self.logger.error(f"Leader node {self.leader_path} disappeared unexpectedly during lease renewal. Relinquishing leadership.")
+                self._relinquish_leadership()
+
+        except Exception as e:
+            self.logger.error(f"Failed to renew lease for {self.leader_path}: {str(e)}. Relinquishing leadership.")
+            # If renewal fails, we must assume we lost leadership
+            self._relinquish_leadership() # Call the proper cleanup function
+
+    def _relinquish_leadership(self):
+        """Voluntarily give up leadership role."""
+        # Only perform actions if currently primary
+        if not self.is_primary:
+            return
+
+        self.logger.info(f"Instance {self.broker_address} relinquishing primary role for group {self.group}.")
+        self.is_primary = False # Set status first
+        if self.mw_obj: self.mw_obj.update_primary_status(False)
+
+        # Stop the lease renewal thread (important!)
+        # Need a mechanism like a threading.Event or checking self.is_primary in the loop
+
+        try:
+            # Delete the leader node associated with this instance
+            if self.zk.exists(self.leader_path):
+                 # Optional: Check if the data is still ours before deleting?
+                 # current_data, _ = self.zk.get(self.leader_path)
+                 # if self.broker_address in current_data.decode():
+                 self.zk.delete(self.leader_path)
+                 self.logger.info(f"Deleted leader znode {self.leader_path} to relinquish leadership.")
+                 # else:
+                 #    self.logger.warning(f"Did not delete {self.leader_path} as data did not match our address.")
+            else:
+                 self.logger.warning(f"Leader znode {self.leader_path} did not exist when trying to relinquish leadership.")
+
+        except Exception as e:
+            self.logger.error(f"Error deleting leader znode {self.leader_path}: {str(e)}")
+
+        # After relinquishing, become a backup and watch for new leader
+        self._become_backup()
 
     def quorum_met(self):
         """Return True if at least 3 Broker replicas are registered."""
@@ -262,7 +400,7 @@ class BrokerAppln():
         """Attempt to spawn a new broker replica using a global lock to ensure only one spawns."""
         self.logger.info("Attempting to spawn a new Broker replica to restore quorum.")
         
-        spawn_lock_path = "/brokers/spawn_lock"
+        spawn_lock_path = f"{self.zk_paths['brokers']}/spawn_lock"
         
         # Check for stale locks and clean up if necessary
         self._cleanup_stale_lock(spawn_lock_path)
@@ -378,29 +516,36 @@ class BrokerAppln():
         self.lease_thread.start()
     
     def _relinquish_leadership(self):
-        """Voluntarily give up leadership role after maximum duration."""
-        self.logger.info("Max leader duration reached. Relinquishing primary role.")
+        """Voluntarily give up leadership role."""
+        # Only perform actions if currently primary
+        if not self.is_primary:
+            return
+
+        self.logger.info(f"Instance {self.broker_address} relinquishing primary role for group {self.group}.")
+        self.is_primary = False # Set status first
+        if self.mw_obj: self.mw_obj.update_primary_status(False)
+
+        # Stop the lease renewal thread (important!)
+        # Need a mechanism like a threading.Event or checking self.is_primary in the loop
+
         try:
+            # Delete the leader node associated with this instance
             if self.zk.exists(self.leader_path):
-                self.zk.delete(self.leader_path)
-                self.logger.info("Deleted leader znode to relinquish leadership.")
-                time.sleep(5)
+                 # Optional: Check if the data is still ours before deleting?
+                 # current_data, _ = self.zk.get(self.leader_path)
+                 # if self.broker_address in current_data.decode():
+                 self.zk.delete(self.leader_path)
+                 self.logger.info(f"Deleted leader znode {self.leader_path} to relinquish leadership.")
+                 # else:
+                 #    self.logger.warning(f"Did not delete {self.leader_path} as data did not match our address.")
+            else:
+                 self.logger.warning(f"Leader znode {self.leader_path} did not exist when trying to relinquish leadership.")
+
         except Exception as e:
-            self.logger.error(f"Error deleting leader znode: {str(e)}")
-        self.is_primary = False
-        self.mw_obj.update_primary_status(False)
-    
-    def _renew_lease(self, discovery_address):
-        """Renew the leadership lease."""
-        new_expiry = time.time() + self.lease_duration
-        new_data = f"{discovery_address}|{new_expiry}"
-        try:
-            self.zk.set(self.leader_path, new_data.encode())
-            self.logger.info(f"Lease renewed; new expiry time: {new_expiry}")
-        except Exception as e:
-            self.logger.error(f"Failed to renew lease: {str(e)}")
-            self.is_primary = False
-            self.mw_obj.update_primary_status(False)
+            self.logger.error(f"Error deleting leader znode {self.leader_path}: {str(e)}")
+
+        # After relinquishing, become a backup and watch for new leader
+        self._become_backup()
 
     def driver(self):
         """Start the broker event loop."""
@@ -439,8 +584,19 @@ class BrokerAppln():
     def cleanup(self):
         """Cleanup the middleware."""
         self.logger.info("BrokerAppln::cleanup")
+        
+        # Relinquish leadership if we are primary
+        if hasattr(self, 'is_primary') and self.is_primary:
+            self._relinquish_leadership()
+        
+        # Clean up middleware
         if self.mw_obj:
             self.mw_obj.cleanup()
+            
+        # Close ZooKeeper connection
+        if self.zk:
+            self.zk.stop()
+            self.zk.close()
 
 
 def parseCmdLineArgs():
@@ -452,6 +608,7 @@ def parseCmdLineArgs():
     parser.add_argument("-z", "--zookeeper", default="localhost:2181", help="ZooKeeper Address")
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, help="Logging level (default=INFO)")
     parser.add_argument("-g", "--group", default="default_group", help="Broker group name")
+    parser.add_argument("-c", "--config", default="config.ini", help="Configuration file path")
     
     return parser.parse_args()
 
@@ -477,6 +634,10 @@ def main():
         # Start the event loop
         broker_app.driver()
         
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user. Shutting down...")
+        broker_app.cleanup()
+        sys.exit(0)
     except Exception as e:
         logger.error(f"Exception in main: {str(e)}")
         broker_app.cleanup()
