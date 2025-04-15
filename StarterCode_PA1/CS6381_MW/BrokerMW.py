@@ -485,15 +485,21 @@ class BrokerMW():
             broker_base_path = "/brokers"
             self.ensure_path_exists(broker_base_path)
             
-            # Extract group name from broker name or use default
-            # Convention: if broker name contains "group" substring, use that as the group
-            group_name = "default_group"
-            if "group" in name:
-                parts = name.split("group")
-                if len(parts) > 1 and parts[1]:
-                    group_name = f"group{parts[1].split('_')[0]}"
+            # Use group name from args directly instead of parsing from name
+            if hasattr(self, 'args') and hasattr(self.args, 'group'):
+                group_name = self.args.group
+                self.logger.info(f"BrokerMW::register - Using group name from args: {group_name}")
+            else:
+                # Fallback to parsing from name 
+                group_name = "default_group"
+                if "group" in name:
+                    parts = name.split("group")
+                    if len(parts) > 1 and parts[1]:
+                        group_name = f"group{parts[1].split('_')[0]}"
+                self.logger.info(f"BrokerMW::register - Parsed group name from broker name: {group_name}")
             
-            self.logger.info(f"BrokerMW::register - Using group name: {group_name}")
+            # Store group name for future use
+            self.group_name = group_name
             
             # Create group path
             group_path = f"{broker_base_path}/{group_name}"
@@ -503,11 +509,11 @@ class BrokerMW():
             replicas_path = f"{group_path}/replicas"
             self.ensure_path_exists(replicas_path)
             
-            # Register this broker as a replica
-            replica_node = f"{replicas_path}/{name}"
-            address_str = f"{self.addr}:{self.port}"
+            # Register this broker as a replica with clean address format (no extra data)
+            replica_node = f"{replicas_path}/{self.addr}:{self.port}"  # Use address as node name for load balancer
+            address_str = f"{self.addr}:{self.port}"  # Clean format
             self.zk_update_node(replica_node, address_str, ephemeral=True)
-            self.logger.info(f"BrokerMW::register - Registered as replica at {replica_node}")
+            self.logger.info(f"BrokerMW::register - Registered as replica at {replica_node} with data {address_str}")
             
             # Only register as a "publisher" if primary (for discovery compatibility if needed)
             self._update_publisher_registration(self.is_primary)

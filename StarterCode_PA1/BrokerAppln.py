@@ -285,11 +285,10 @@ class BrokerAppln():
         # This ensures subscribers can find us via Discovery service lookup (optional compatibility)
         try:
             flat_broker_path = f"/brokers/{self.name}"
-            # Use zk_update_node logic (create or update) for the flat path
-            # Ensure mw_obj is initialized before calling its methods
+            # Use clean address format without any extra data
             if self.mw_obj:
                  self.mw_obj.zk_update_node(flat_broker_path, self.broker_address, ephemeral=True)
-                 self.logger.info(f"BrokerAppln::_attempt_leadership_election - Ensured flat broker node registration at {flat_broker_path}")
+                 self.logger.info(f"BrokerAppln::_attempt_leadership_election - Updated flat broker node at {flat_broker_path}")
             else:
                  self.logger.warning("BrokerAppln::_attempt_leadership_election - Middleware object not initialized, cannot register flat broker node.")
         except Exception as e:

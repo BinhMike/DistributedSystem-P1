@@ -103,6 +103,7 @@ class BrokerLoadBalancer:
     
     def _setup_group_watches(self, group):
         """Setup watches for a specific broker group."""
+        # Ensure the group exists in our structure
         if group not in self.broker_groups:
             self.broker_groups[group] = {"leader": None, "replicas": set()}
         
@@ -110,16 +111,24 @@ class BrokerLoadBalancer:
         leader_path = f"{group_path}/leader"
         replicas_path = f"{group_path}/replicas"
         
+        # Ensure the group has both required paths
+        if not self.zk.exists(group_path):
+            self.logger.error(f"Group path {group_path} doesn't exist")
+            return
+            
         # Initialize leader data immediately if it exists, don't wait for watch event
         if self.zk.exists(leader_path):
             try:
                 data, _ = self.zk.get(leader_path)
                 if data:
+                    # Extract just the address part (before the pipe symbol)
                     leader_info = data.decode().split('|')[0]
                     self.broker_groups[group]["leader"] = leader_info
                     self.logger.info(f"Group {group} primary broker initialized: {leader_info}")
             except Exception as e:
                 self.logger.error(f"Error initializing leader for {group}: {str(e)}")
+        else:
+            self.logger.warning(f"Leader path {leader_path} doesn't exist yet")
         
         # Initialize replica data immediately if it exists, don't wait for watch event
         if self.zk.exists(replicas_path):
@@ -131,49 +140,65 @@ class BrokerLoadBalancer:
                     try:
                         broker_path = f"{replicas_path}/{broker_id}"
                         data, _ = self.zk.get(broker_path)
-                        broker_addr = data.decode()
-                        self.broker_groups[group]["replicas"].add(broker_addr)
-                        self.logger.info(f"Added broker replica: {broker_addr} for group {group}")
-                        self._connect_to_broker(broker_addr)
+                        if data:
+                            # Store the raw broker address
+                            broker_addr = data.decode()
+                            self.broker_groups[group]["replicas"].add(broker_addr)
+                            self.logger.info(f"Added broker replica: {broker_addr} for group {group}")
+                            self._connect_to_broker(broker_addr)
                     except Exception as e:
                         self.logger.error(f"Error processing replica {broker_id}: {str(e)}")
             except Exception as e:
                 self.logger.error(f"Error initializing replicas for {group}: {str(e)}")
+        else:
+            self.logger.warning(f"Replicas path {replicas_path} doesn't exist yet")
         
         # Watch for leader changes
         @self.zk.DataWatch(leader_path)
         def watch_leader(data, stat, event):
             if data:
-                leader_info = data.decode().split('|')[0]
-                self.broker_groups[group]["leader"] = leader_info
-                self.logger.info(f"Group {group} primary broker updated: {leader_info}")
+                try:
+                    # Extract just the address part (before the pipe symbol)
+                    leader_info = data.decode().split('|')[0]
+                    self.broker_groups[group]["leader"] = leader_info
+                    self.logger.info(f"Group {group} primary broker updated: {leader_info}")
+                except Exception as e:
+                    self.logger.error(f"Error processing leader update for {group}: {str(e)}")
+            elif event and event.type == "DELETED":
+                self.logger.warning(f"Leader node for {group} was deleted")
+                # Handle leader deletion (optional)
+                self.broker_groups[group]["leader"] = None
         
         # Watch for replica changes
         @self.zk.ChildrenWatch(replicas_path)
         def watch_replicas(children):
             self.logger.info(f"Group {group} broker replicas changed: {len(children)} replicas")
-            new_brokers = set()
-            
-            for broker_id in children:
-                try:
-                    broker_path = f"{replicas_path}/{broker_id}"
-                    data, _ = self.zk.get(broker_path)
-                    broker_addr = data.decode()
-                    new_brokers.add(broker_addr)
-                except Exception as e:
-                    self.logger.error(f"Error getting broker data: {str(e)}")
-            
-            # Handle changed broker list
-            old_brokers = self.broker_groups[group]["replicas"].copy()
-            self.broker_groups[group]["replicas"] = new_brokers
-            
-            # Connect to new brokers
-            for broker in new_brokers - old_brokers:
-                self._connect_to_broker(broker)
-            
-            # Disconnect from removed brokers
-            for broker in old_brokers - new_brokers:
-                self._disconnect_from_broker(broker)
+            try:
+                new_brokers = set()
+                
+                for broker_id in children:
+                    try:
+                        broker_path = f"{replicas_path}/{broker_id}"
+                        data, _ = self.zk.get(broker_path)
+                        if data:
+                            broker_addr = data.decode()
+                            new_brokers.add(broker_addr)
+                    except Exception as e:
+                        self.logger.error(f"Error getting broker data: {str(e)}")
+                
+                # Handle changed broker list
+                old_brokers = self.broker_groups[group]["replicas"].copy()
+                self.broker_groups[group]["replicas"] = new_brokers
+                
+                # Connect to new brokers
+                for broker in new_brokers - old_brokers:
+                    self._connect_to_broker(broker)
+                
+                # Disconnect from removed brokers
+                for broker in old_brokers - new_brokers:
+                    self._disconnect_from_broker(broker)
+            except Exception as e:
+                self.logger.error(f"Error processing replica updates for {group}: {str(e)}")
     
     def _setup_frontend_sockets(self, pub_port, sub_port):
         """Set up frontend sockets for publishers and subscribers."""
@@ -334,6 +359,9 @@ class BrokerLoadBalancer:
                             self.logger.warning(f"{self.brokers_path} path does not exist in ZooKeeper!")
                     except Exception as e:
                         self.logger.error(f"Error inspecting ZooKeeper: {str(e)}")
+                
+                if not any(isinstance(group, dict) and "replicas" in group and group["replicas"] for group in self.broker_groups.values()):
+                    self.logger.warning("No active brokers available in any group. Broker groups: %s", list(self.broker_groups.keys()))
                 
                 time.sleep(5)  # Increased for less frequent logs
                 

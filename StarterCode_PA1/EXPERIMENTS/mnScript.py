@@ -113,31 +113,32 @@ def run():
         disc.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg blue -fg white -hold -e "python3 DiscoveryAppln.py -p {port} -a {ip} -z {zk_ip}:2181 -l 20" &')
         time.sleep(1)  # Stagger the starts
 
-    # Start Broker Load Balancer - purple background
-    print("\nStarting Broker Load Balancer...")
-    title = f"Load Balancer ({lb_ip})"
-    lb.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg purple -fg white -hold -e "python3 BrokerLB.py --addr {lb_ip} -z {zk_ip}:2181 -l 20" &')
-    time.sleep(2)
-
     # Start Brokers Group 1 - red background
     print("\nStarting Broker Group 1...")
     for i, (broker, ip) in enumerate(zip(brokers_group1, broker1_ips)):
         port = 6000 + i
         title = f"Broker Group 1-{i+1} ({ip}:{port})"
         broker.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg red -fg white -hold -e "python3 BrokerAppln.py -n broker1_{i+1} -p {port} --addr {ip} -z {zk_ip}:2181 -g group1 -l 20" &')
-        time.sleep(2)  # Give each broker time to initialize
+        time.sleep(1)  # Give each broker time to initialize
 
     # Start Brokers Group 2 - orange background
     print("\nStarting Broker Group 2...")
     for i, (broker, ip) in enumerate(zip(brokers_group2, broker2_ips)):
-        port = 6000 + i
+        port = 6200 + i  # Using different port range to avoid conflicts
         title = f"Broker Group 2-{i+1} ({ip}:{port})"
         broker.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg orange -fg black -hold -e "python3 BrokerAppln.py -n broker2_{i+1} -p {port} --addr {ip} -z {zk_ip}:2181 -g group2 -l 20" &')
-        time.sleep(2)  # Give each broker time to initialize
+        time.sleep(1)  # Give each broker time to initialize
 
-    # Wait for brokers to fully initialize and elect leaders
-    print("\nWaiting for broker initialization and leader election...")
-    time.sleep(15)
+    # Wait for brokers to fully initialize and register with ZooKeeper
+    print("\nWaiting for broker groups to initialize in ZooKeeper...")
+    time.sleep(5)
+
+    # Start Broker Load Balancer with topic mapping - purple background
+    print("\nStarting Broker Load Balancer...")
+    title = f"Load Balancer ({lb_ip})"
+    # Added topic mapping and verbose logging
+    lb.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg purple -fg white -hold -e "python3 BrokerLB.py --addr {lb_ip} -z {zk_ip}:2181 -l 10 -d group1 -m weather:group1,light:group2,altitude:group1,humidity:group2,location:group1,temperature:group2,pressure:group1,airquality:group2,sound:group1" &')
+    time.sleep(2)
 
     # Start Publishers - green background
     print("\nStarting Publishers...")
@@ -145,14 +146,14 @@ def run():
         port = 5577 + i
         title = f"Publisher {i+1} ({ip}:{port})"
         pub.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg green -fg black -hold -e "python3 PublisherAppln.py -n pub{i+1} -a {ip} -p {port} -z {zk_ip}:2181 -T 2 -f 1 -i 1000 -l 20" &')
-        time.sleep(2)
+        time.sleep(1)
 
     # Start Subscribers - cyan background
     print("\nStarting Subscribers...")
     for i, (sub, ip) in enumerate(zip(subscribers, subscriber_ips)):
         title = f"Subscriber {i+1} ({ip})"
         sub.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg cyan -fg black -hold -e "python3 SubscriberAppln.py -n sub{i+1} -z {zk_ip}:2181 -T 9 -l 20" &')
-        time.sleep(2)
+        time.sleep(1)
 
     # Set up monitor station for testing failover scenarios
     monitor.cmd(f'xterm -T "Test Monitor Station" -fa "Monospace" -fs 12 -geometry 120x40 -bg white -fg black -hold -e "echo \'Welcome to the Test Monitor Station\n\nZooKeeper: {zk_ip}:2181\nDiscovery: {discovery_ips}\nBrokers Group 1: {broker1_ips}\nBrokers Group 2: {broker2_ips}\nPublishers: {publisher_ips}\nSubscribers: {subscriber_ips}\n\nExample commands:\n- Check broker leaders: echo stat | nc {zk_ip} 2181 | grep brokers\n- Kill primary broker: ssh {broker1_ips[0]} pkill -f BrokerAppln\n- Kill discovery leader: ssh {discovery_ips[0]} pkill -f DiscoveryAppln\n- Check status: ps -ef | grep -E \"(Broker|Discovery|Publisher|Subscriber)Appln\" | grep -v grep\n\nUse this monitor to test failover scenarios\'; bash" &')
