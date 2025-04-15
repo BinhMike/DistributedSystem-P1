@@ -279,20 +279,8 @@ class BrokerAppln():
              else:
                  self.is_primary = False
                  self.mw_obj.update_primary_status(False)
-
-
-        # Regardless of leadership status, register with Discovery service in the flat structure
-        # This ensures subscribers can find us via Discovery service lookup (optional compatibility)
-        try:
-            flat_broker_path = f"/brokers/{self.name}"
-            # Use clean address format without any extra data
-            if self.mw_obj:
-                 self.mw_obj.zk_update_node(flat_broker_path, self.broker_address, ephemeral=True)
-                 self.logger.info(f"BrokerAppln::_attempt_leadership_election - Updated flat broker node at {flat_broker_path}")
-            else:
-                 self.logger.warning("BrokerAppln::_attempt_leadership_election - Middleware object not initialized, cannot register flat broker node.")
-        except Exception as e:
-            self.logger.error(f"BrokerAppln::_attempt_leadership_election - Error registering flat broker node {flat_broker_path}: {str(e)}")
+        
+        # No need to register in flat structure - only use the standard nested broker structure
 
     def _become_primary(self, lease_expiry):
         """Handle transition to primary role."""

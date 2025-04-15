@@ -522,7 +522,7 @@ class DiscoveryAppln:
             self.logger.error(f"Error during publisher lookup: {str(e)}")
             
     def _lookup_brokers_with_group_structure(self, topics, matched_nodes):
-        """Find appropriate brokers using the group structure, with fallback to flat structure."""
+        """Find appropriate brokers using the group structure."""
         broker_base_path = "/brokers"
         self.logger.info("ViaBroker mode: Looking up brokers in group structure")
         self.logger.info(f"DEBUG: Broker base path is {broker_base_path}")
@@ -548,12 +548,10 @@ class DiscoveryAppln:
 
             self.logger.info(f"DEBUG: Found children under /brokers: {children}")
 
-            # Separate groups from potential flat broker nodes
+            # Identify broker groups (format: group1, group2, etc.)
             groups = [child for child in children if child.startswith("group")]
-            flat_brokers = [child for child in children if not child.startswith("group") and child not in ["leader", "replicas", "spawn_lock"]]
 
             self.logger.info(f"DEBUG: Identified groups: {groups}")
-            self.logger.info(f"DEBUG: Identified potential flat brokers: {flat_brokers}")
 
             # Dump entire ZooKeeper structure for debugging
             self.logger.info("DEBUG: Current ZooKeeper broker structure:")
@@ -614,51 +612,17 @@ class DiscoveryAppln:
                 else:
                     self.logger.info(f"DEBUG: Group {group_name} not found in available groups {groups}")
 
-            # --- Fallback Strategy: Use flat broker nodes if no group leaders were found ---
-            if not found_in_groups and flat_brokers:
-                self.logger.info("DEBUG: No specific group leaders found or matched. Falling back to flat broker nodes.")
-                for broker_id in flat_brokers:
-                    broker_path = f"{broker_base_path}/{broker_id}"
-                    try:
-                        if self.zk.exists(broker_path):
-                            data, _ = self.zk.get(broker_path)
-                            broker_info = data.decode()
-                            self.logger.info(f"DEBUG: Checking flat broker {broker_id} with data: {broker_info}")
-                            if ":" in broker_info:
-                                # Handle potential extra data like topic mapping
-                                addr_port = broker_info.split("|")[0]
-                                addr, port_str = addr_port.split(":")
-                                try:
-                                    port = int(port_str)
-                                    node_info = discovery_pb2.RegistrantInfo(
-                                        id=broker_id,
-                                        addr=addr,
-                                        port=port
-                                    )
-                                    # Check if already added
-                                    already_added = any(node.addr == addr and node.port == port for node in matched_nodes)
-                                    if not already_added:
-                                        matched_nodes.append(node_info)
-                                        self.logger.info(f"DEBUG: Added flat broker {broker_id} at {addr}:{port} as fallback")
-                                        # In fallback, often adding one is enough, but let's add all found flat ones
-                                except ValueError:
-                                     self.logger.error(f"DEBUG: Invalid port number in flat broker data: {port_str}")
-                            else:
-                                self.logger.error(f"DEBUG: Invalid format for flat broker data: {broker_info}")
-                    except Exception as e:
-                        self.logger.error(f"DEBUG: Error processing flat broker {broker_id}: {str(e)}")
-
-            # --- Final Fallback: Use *any* group leader if still nothing found ---
+            # --- Final Fallback: Use *any* group leader if specific group not found ---
             if not matched_nodes and groups:
-                 self.logger.info("DEBUG: Still no brokers found. Falling back to *any* available group leader.")
+                 self.logger.info("DEBUG: No specific group matched. Falling back to any available group leader.")
                  for group_name in groups:
                     leader_path = f"{broker_base_path}/{group_name}/leader"
-                    self.logger.info(f"DEBUG: Checking final fallback leader at {leader_path}")
+                    self.logger.info(f"DEBUG: Checking fallback leader at {leader_path}")
                     if self.zk.exists(leader_path):
-                        self.logger.info(f"DEBUG: Final fallback leader exists at {leader_path}")
+                        self.logger.info(f"DEBUG: Fallback leader exists at {leader_path}")
                         data, _ = self.zk.get(leader_path)
                         broker_info = data.decode()
-                        self.logger.info(f"DEBUG: Final fallback leader data: {broker_info}")
+                        self.logger.info(f"DEBUG: Fallback leader data: {broker_info}")
 
                         if "|" in broker_info: broker_info = broker_info.split("|")[0]
 
@@ -675,16 +639,14 @@ class DiscoveryAppln:
                                 already_added = any(node.addr == addr and node.port == port for node in matched_nodes)
                                 if not already_added:
                                     matched_nodes.append(node_info)
-                                    self.logger.info(f"DEBUG: Added broker from group {group_name} as final fallback")
-                                    break # Found one, that's enough for final fallback
+                                    self.logger.info(f"DEBUG: Added broker from group {group_name} as fallback")
+                                    break # Found one, that's enough for fallback
                             except ValueError:
-                                self.logger.error(f"DEBUG: Invalid port number in final fallback leader data: {port_str}")
+                                self.logger.error(f"DEBUG: Invalid port number in fallback leader data: {port_str}")
                         else:
-                            self.logger.error(f"DEBUG: Invalid format for final fallback leader data: {broker_info}")
+                            self.logger.error(f"DEBUG: Invalid format for fallback leader data: {broker_info}")
                     else:
-                        self.logger.info(f"DEBUG: No final fallback leader found at {leader_path}")
-
-
+                        self.logger.info(f"DEBUG: No fallback leader found at {leader_path}")
         except Exception as e:
             self.logger.error(f"DEBUG: Error during broker lookup: {str(e)}")
             # Log the stack trace for detailed debugging

@@ -203,6 +203,22 @@ class SubscriberMW:
             broker_path = self.zk_paths["brokers"]
             self.logger.info(f"SubscriberMW::lookup_broker_for_topic - Looking for broker groups under {broker_path}")
             
+            # First check if load balancers exist - preferred connection method
+            lb_path = self.zk_paths["load_balancers"]
+            if self.zk.exists(lb_path):
+                lb_nodes = self.zk.get_children(lb_path)
+                if lb_nodes:
+                    # Get the first load balancer
+                    lb_node_path = f"{lb_path}/{lb_nodes[0]}"
+                    data, _ = self.zk.get(lb_node_path)
+                    if data:
+                        lb_info = data.decode().split(":")
+                        if len(lb_info) >= 3:  # format is addr:pub_port:sub_port
+                            lb_addr = lb_info[0]
+                            lb_sub_port = lb_info[2]
+                            self.logger.info(f"Found load balancer at {lb_addr}:{lb_sub_port} for topic {topic}")
+                            return f"{lb_addr}:{lb_sub_port}"
+            
             # Check if the brokers path exists
             if not self.zk.exists(broker_path):
                 self.logger.warning(f"Broker path {broker_path} does not exist in ZooKeeper")
@@ -210,6 +226,9 @@ class SubscriberMW:
             
             # Get all broker groups
             groups = self.zk.get_children(broker_path)
+            # Filter out non-group nodes 
+            groups = [group for group in groups if group.startswith("group")]
+            
             if not groups:
                 self.logger.warning(f"No broker groups found under {broker_path}")
                 return None

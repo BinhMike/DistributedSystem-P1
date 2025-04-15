@@ -150,24 +150,33 @@ class SubscriberAppln:
             # Check if we got any publishers/brokers
             if not lookup_resp.publishers:
                 self.logger.error("No publishers/brokers found")
+                # Try to connect to brokers directly through the nested structure
+                self._try_connect_to_brokers()
                 return 1
 
-            # Check each publisher to see if it's a broker (has a group ID)
-            broker_connected = False
-            for pub in lookup_resp.publishers:
-                if pub.addr and pub.port:
-                    pub_address = f"tcp://{pub.addr}:{pub.port}"
-                    # Check if this is a broker by looking for group ID in the name
-                    is_broker = ":" in pub.id and "grp=" in pub.id 
-                    self.logger.info(f"Connecting to {'broker' if is_broker else 'publisher'} at {pub_address}")
-                    self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
-                    
-                    # If we connected to at least one broker, set flag
-                    if is_broker:
-                        broker_connected = True
+            # Check if any of the responses are brokers by looking for group ID in the name
+            broker_publishers = [pub for pub in lookup_resp.publishers if ":" in pub.id and "grp=" in pub.id]
+            non_broker_publishers = [pub for pub in lookup_resp.publishers if ":" not in pub.id or "grp=" not in pub.id]
             
-            # If no brokers were found, try to find them directly through ZooKeeper
-            if not broker_connected:
+            # If broker publishers are available, prefer them over direct publishers
+            if broker_publishers:
+                self.logger.info(f"Using broker mode with {len(broker_publishers)} brokers")
+                for pub in broker_publishers:
+                    if pub.addr and pub.port:
+                        pub_address = f"tcp://{pub.addr}:{pub.port}"
+                        self.logger.info(f"Connecting to broker at {pub_address} (ID: {pub.id})")
+                        self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
+            # Otherwise use direct publishers
+            elif non_broker_publishers:
+                self.logger.info(f"Using direct publisher mode with {len(non_broker_publishers)} publishers")
+                for pub in non_broker_publishers:
+                    if pub.addr and pub.port:
+                        pub_address = f"tcp://{pub.addr}:{pub.port}"
+                        self.logger.info(f"Connecting to publisher at {pub_address}")
+                        self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
+            
+            # If no connections were made through discovery, try direct ZooKeeper lookup
+            if not broker_publishers and not non_broker_publishers:
                 self._try_connect_to_brokers()
             
             self.logger.info("Moving to LISTENING state")
