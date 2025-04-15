@@ -13,6 +13,14 @@ from kazoo.client import KazooClient  # ZooKeeper client
 from kazoo.exceptions import NodeExistsError
 from CS6381_MW.DiscoveryMW import DiscoveryMW
 from CS6381_MW import discovery_pb2
+import hashlib
+
+# Helper function to hash topic to get group id
+def consistent_hash(text):
+    # Compute the MD5 hash of the text.
+    md5_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+    # Convert the hexadecimal digest to an integer.
+    return int(md5_hash, 16)
 
 # Helper function for getting new port for quorum spawning
 def get_free_port():
@@ -44,6 +52,8 @@ class DiscoveryAppln:
         self.lease_thread = None          # Thread for lease renewal
         self.args = None                # Will store command-line args
         self.bootstrap_complete = False # Flag to indicate bootstrapping is complete
+        # NEW: number of virtual groups to simulate for load balancing.
+        self.num_virtual_groups = 3
 
     ########################################
     # Quorum Check Helper
@@ -65,42 +75,32 @@ class DiscoveryAppln:
         """Attempt to spawn a new Discovery replica using a global lock to ensure only one spawns."""
         self.logger.info("Attempting to spawn a new Discovery replica to restore quorum.")
         
-        # Check if there's a stale lock before trying to acquire
         spawn_lock_path = "/discovery/spawn_lock"
         
-        # First check if the lock node exists
+        # First, check for a stale lock
         if self.zk.exists(f"{spawn_lock_path}/lock"):
             try:
-                # Get lock data and creation time
                 data, stat = self.zk.get(f"{spawn_lock_path}/lock")
-                lock_age = time.time() - (stat.ctime / 1000)  # ZK time is in milliseconds
-                
-                # If lock is older than 60 seconds, consider it stale
+                lock_age = time.time() - (stat.ctime / 1000)  # ZK time is in ms
                 if lock_age > 60:
                     self.logger.warning(f"Detected stale lock (age: {lock_age:.1f}s). Attempting to clean up.")
                     try:
                         self.zk.delete(f"{spawn_lock_path}/lock")
                         self.logger.info("Successfully cleaned up stale lock node.")
-                        # Give ZK a moment to fully process the deletion
                         time.sleep(1)
                     except Exception as e:
                         self.logger.error(f"Failed to clean up stale lock: {str(e)}")
             except Exception as e:
                 self.logger.error(f"Error checking lock age: {str(e)}")
         
-        # Now try to acquire the lock with a retry mechanism
         max_retries = 2
         for attempt in range(max_retries):
             try:
                 spawn_lock = Lock(self.zk, spawn_lock_path)
-                
-                # Use a shorter timeout initially, then longer
                 timeout = 5 if attempt == 0 else 10
-                
                 self.logger.info(f"Attempting to acquire spawn lock (attempt {attempt+1}/{max_retries}, timeout: {timeout}s)")
                 if spawn_lock.acquire(timeout=timeout):
                     try:
-                        # Re-check quorum status with lock held
                         replicas = self.zk.get_children(self.replicas_path)
                         if len(replicas) >= 3:
                             self.logger.info("Quorum restored while waiting for lock; no need to spawn.")
@@ -109,25 +109,19 @@ class DiscoveryAppln:
                         free_port = get_free_port()
                         self.logger.info(f"Spawning new replica on port {free_port}")
                         
-                        # Build command, carefully handling optional arguments
                         cmd = ["gnome-terminal", "--", "bash", "-c"]
                         spawn_cmd = f"python3 {sys.argv[0]} -p {free_port} -a {self.args.addr} -z {self.args.zookeeper} -l {self.args.loglevel}"
-                        
-                        # Add config flag only if it was provided
                         if hasattr(self.args, 'config') and self.args.config:
                             spawn_cmd += f" -c {self.args.config}"
-                        
                         spawn_cmd += "; exec bash"
                         cmd.append(spawn_cmd)
                         
-                        # Launch the new discovery process
                         subprocess.Popen(cmd)
                         self.logger.info(f"Spawned new Discovery replica with command: {spawn_cmd}")
-                        return  # Successfully spawned
+                        return
                     except Exception as e:
                         self.logger.error(f"Error while spawn lock was held: {str(e)}")
                     finally:
-                        # Always release the lock
                         try:
                             spawn_lock.release()
                             self.logger.info("Spawn lock released successfully")
@@ -137,13 +131,10 @@ class DiscoveryAppln:
                     self.logger.warning(f"Could not acquire spawn lock on attempt {attempt+1}")
             except Exception as e:
                 self.logger.error(f"Exception during lock handling on attempt {attempt+1}: {str(e)}")
-            
-            # Wait before retrying
             if attempt < max_retries - 1:
                 backoff = 3 * (attempt + 1)
                 self.logger.info(f"Waiting {backoff}s before retry...")
                 time.sleep(backoff)
-        
         self.logger.error("Failed to spawn a new replica after multiple attempts")
 
     ########################################
@@ -209,7 +200,7 @@ class DiscoveryAppln:
                     self.logger.warning("Quorum not met: fewer than 3 replicas active.")
                     self.spawn_replica()
 
-            # Wait for bootstrap: ensure that at least 3 replicas are active before proceeding.
+            # Wait for bootstrap
             self.wait_for_bootstrap()
 
             # Attempt to become the leader by creating the ephemeral leader node.
@@ -218,7 +209,7 @@ class DiscoveryAppln:
             try:
                 self.zk.create(self.leader_path, leader_data.encode(), ephemeral=True)
                 self.is_primary = True
-                self.leader_start_time = time.time()  # Record when we became leader
+                self.leader_start_time = time.time()
                 self.logger.info(f"Instance {discovery_address} became primary with lease expiring at {lease_expiry}.")
                 self.start_lease_renewal(discovery_address)
             except NodeExistsError:
@@ -236,7 +227,7 @@ class DiscoveryAppln:
                                 new_data = f"{discovery_address}|{new_expiry}"
                                 self.zk.create(self.leader_path, new_data.encode(), ephemeral=True)
                                 self.is_primary = True
-                                self.leader_start_time = time.time()  # Reset the leader start time
+                                self.leader_start_time = time.time()
                                 self.logger.info(f"This instance has now become the primary with lease expiring at {new_expiry}!")
                                 self.start_lease_renewal(discovery_address)
                             else:
@@ -249,7 +240,6 @@ class DiscoveryAppln:
                             self.logger.error(f"Error during leadership transition: {str(e)}")
                             self.is_primary = False
 
-            # Log current leader information for debugging
             if self.zk.exists(self.leader_path):
                 data, _ = self.zk.get(self.leader_path)
                 self.logger.info(f"Current leader in ZooKeeper: {data.decode()}")
@@ -307,10 +297,10 @@ class DiscoveryAppln:
         self.lease_thread.start()
 
     ########################################
-    # Handle Registration Request
+    # Handle Registration Request with Virtual Group Mapping
     ########################################
     def register(self, register_req):
-        """ Handle publisher/subscriber registration """
+        """Handle publisher/subscriber registration, with virtual group assignment for publishers."""
         if not self.quorum_met():
             self.logger.warning("Quorum not met. Rejecting registration.")
             response = discovery_pb2.DiscoveryResp()
@@ -335,37 +325,41 @@ class DiscoveryAppln:
             response.register_resp.status = discovery_pb2.STATUS_NOT_PRIMARY
             return response
 
-        # Map role to correct ZooKeeper path category
+        # For Publishers, compute a virtual group mapping for each topic.
+        topic_group_info = {}
+        if role == "Publisher":
+            for topic in register_req.topiclist:
+                group_id = consistent_hash(topic) % self.num_virtual_groups
+                topic_group_info[topic] = group_id
+                self.logger.debug(f"Computed virtual group {group_id} for topic '{topic}' for publisher {entity_id}")
+            mapping_str = ",".join([f"{t}:{topic_group_info[t]}" for t in topic_group_info])
+            entity_data = f"{register_req.info.addr}:{register_req.info.port}|{mapping_str}"
+            self.logger.info(f"Publisher {entity_id} assigned virtual group mapping: {mapping_str}")
+        else:
+            entity_data = f"{register_req.info.addr}:{register_req.info.port}"
+            # Log that no virtual group assignment is performed for subscribers or brokers.
+            self.logger.info(f"{role} {entity_id} registered without virtual group assignment.")
+
+        # Determine the ZooKeeper path category.
         if role == "Broker":
-            # Brokers should be registered directly under /brokers
             category = "brokers"
         else:
             category = role.lower() + "s"  # "publishers" or "subscribers"
-        
         entity_path = f"/{category}/{entity_id}"
-        entity_data = f"{register_req.info.addr}:{register_req.info.port}"
 
         try:
-            # Ensure the category path exists
             self.zk.ensure_path(f"/{category}")
-            
-            # Create or update entity node
             if self.zk.exists(entity_path):
                 self.logger.info(f"Node {entity_path} already exists, updating it")
                 self.zk.delete(entity_path)
-            
-            # Create the entity node as ephemeral so it disappears when client disconnects
             self.zk.create(entity_path, entity_data.encode(), ephemeral=True)
-            self.logger.info(f"Created/updated ZooKeeper node {entity_path}")
-            
-            # For brokers, also register in the replicas path for quorum management
+            self.logger.info(f"Created/updated ZooKeeper node {entity_path} with data: {entity_data}")
+            # For brokers, also register in the replicas path for quorum management.
             if role == "Broker" and category == "brokers":
                 broker_replica_path = f"/brokers/replicas/{entity_id}"
                 self.zk.ensure_path("/brokers/replicas")
-                
                 if self.zk.exists(broker_replica_path):
                     self.zk.delete(broker_replica_path)
-                    
                 self.zk.create(broker_replica_path, entity_data.encode(), ephemeral=True)
                 self.logger.info(f"Registered broker in replica path: {broker_replica_path}")
         except Exception as e:
@@ -375,12 +369,15 @@ class DiscoveryAppln:
             response.register_resp.status = discovery_pb2.STATUS_FAILURE
             return response
 
-        # Update in-memory registry
-        self.registry[category][entity_id] = {
+        # Update the in-memory registry.
+        entry = {
             "addr": register_req.info.addr,
             "port": register_req.info.port,
             "topics": list(register_req.topiclist)
         }
+        if role == "Publisher":
+            entry["group_mapping"] = topic_group_info
+        self.registry[category][entity_id] = entry
 
         response = discovery_pb2.DiscoveryResp()
         response.msg_type = discovery_pb2.TYPE_REGISTER
@@ -388,10 +385,10 @@ class DiscoveryAppln:
         return response
 
     ########################################
-    # Handle Lookup Request
+    # Handle Lookup Request with Filtering by Virtual Group
     ########################################
     def lookup(self, lookup_req):
-        """ Handle subscriber lookup request """
+        """Handle subscriber lookup request and return only publishers whose virtual group matches the topic."""
         self.logger.info(f"Lookup request for topics: {lookup_req.topiclist}")
 
         if not self.quorum_met():
@@ -408,7 +405,6 @@ class DiscoveryAppln:
             return response
 
         matched_nodes = []
-
         if self.dissemination_strategy == "Direct":
             path = "/publishers"
             self.logger.info("Direct mode: Looking up publishers")
@@ -416,27 +412,63 @@ class DiscoveryAppln:
             path = "/brokers"
             self.logger.info("ViaBroker mode: Looking up brokers")
 
+        # For each topic requested, compute expected virtual group and log it.
+        for topic in lookup_req.topiclist:
+            expected_group = consistent_hash(topic) % self.num_virtual_groups
+            self.logger.info(f"Subscriber lookup: For topic '{topic}' expected virtual group is {expected_group}")
+
         try:
             if self.zk.exists(path):
                 nodes = self.zk.get_children(path)
                 self.logger.info(f"Found {len(nodes)} nodes in ZooKeeper under {path}")
                 for node_id in nodes:
-                    # Skip system nodes
                     if node_id in ["leader", "replicas", "spawn_lock"]:
-                        self.logger.warning(f"Skipping system node '{node_id}' found in {path}")
+                        self.logger.warning(f"Skipping system node '{node_id}' in {path}")
                         continue
                     try:
                         data, _ = self.zk.get(f"{path}/{node_id}")
                         node_data = data.decode()
-                        if ":" in node_data:
-                            addr, port = node_data.split(":")
-                            node_info = discovery_pb2.RegistrantInfo(id=node_id, addr=addr, port=int(port))
-                            matched_nodes.append(node_info)
-                            self.logger.info(f"Added {node_id} at {addr}:{port} to response")
+                        if "|" in node_data:
+                            # Data format: "addr:port|topic1:group1,topic2:group2,..."
+                            addr_port, mapping_str = node_data.split("|")
+                            addr_parts = addr_port.split(":")
+                            if len(addr_parts) != 2:
+                                self.logger.error(f"Invalid address format in node {node_id}: {addr_port}")
+                                continue
+                            addr = addr_parts[0]
+                            port = int(addr_parts[1])
+                            # Build a mapping dictionary.
+                            mapping = {}
+                            for pair in mapping_str.split(","):
+                                if ":" in pair:
+                                    topic, grp = pair.split(":")
+                                    mapping[topic] = int(grp)
+                            # For each topic requested by the subscriber,
+                            # compute the expected group and if it matches, add the publisher.
+                            for topic in lookup_req.topiclist:
+                                expected_group = consistent_hash(topic) % self.num_virtual_groups
+                                if topic in mapping and mapping[topic] == expected_group:
+                                    node_info = discovery_pb2.RegistrantInfo(
+                                        id=f"{node_id}:grp={mapping[topic]}",
+                                        addr=addr,
+                                        port=port
+                                    )
+                                    matched_nodes.append(node_info)
+                                    self.logger.info(f"Added publisher {node_id} (group {mapping[topic]}) for topic '{topic}'")
+                                    break  # Only add publisher once even if it serves multiple topics.
                         else:
-                            self.logger.error(f"Node {node_id} has invalid data format: {node_data}")
+                            # If no virtual group mapping is present, fall back to original format.
+                            if ":" in node_data:
+                                addr, port = node_data.split(":")
+                                node_info = discovery_pb2.RegistrantInfo(id=node_id, addr=addr, port=int(port))
+                                matched_nodes.append(node_info)
+                                self.logger.info(f"Added {node_id} at {addr}:{port} to response")
+                            else:
+                                self.logger.error(f"Node {node_id} has invalid data format: {node_data}")
                     except Exception as e:
                         self.logger.error(f"Error retrieving node {node_id}: {str(e)}")
+            else:
+                self.logger.warning(f"Path {path} does not exist in ZooKeeper")
         except Exception as e:
             self.logger.error(f"Error during lookup: {str(e)}")
 
@@ -450,64 +482,48 @@ class DiscoveryAppln:
     # Run the Discovery Service
     ########################################
     def run(self):
-        """ Run Discovery Service Event Loop """
+        """Run Discovery Service Event Loop."""
         self.logger.info("DiscoveryAppln::run - entering event loop")
         try:
-            # Register cleanup handlers
             atexit.register(self.cleanup)
-            # Run the event loop
             self.mw_obj.event_loop()
         except KeyboardInterrupt:
             self.logger.info("KeyboardInterrupt received, shutting down")
         except Exception as e:
             self.logger.error(f"Exception in event loop: {e}")
         finally:
-            # Ensure cleanup happens
             self.cleanup()
 
     def cleanup(self):
-        """Clean up resources and deregister from ZooKeeper"""
+        """Clean up resources and deregister from ZooKeeper."""
         try:
             self.logger.info("DiscoveryAppln::cleanup - Performing cleanup operations")
-            
-            # Stop the lease renewal thread if it's running
             self.is_primary = False
             if self.lease_thread and self.lease_thread.is_alive():
                 self.lease_thread.join(timeout=2)
-                
-            # Explicitly delete our leader node if we're the primary
             if self.zk and self.zk.connected and self.leader_path:
                 if self.zk.exists(self.leader_path):
                     try:
                         data, _ = self.zk.get(self.leader_path)
-                        our_addr = f"{args.addr}:{args.port}" if 'args' in globals() else None
-                        
-                        # Only delete if it's our node
+                        our_addr = f"{self.args.addr}:{self.args.port}" if self.args else None
                         if data and our_addr and our_addr in data.decode():
                             self.logger.info("Deleting our leader node from ZooKeeper")
                             self.zk.delete(self.leader_path)
                     except Exception as e:
                         self.logger.warning(f"Error deleting leader node: {e}")
-            
-            # Close the ZooKeeper connection
             if self.zk:
                 self.logger.info("Closing ZooKeeper connection")
                 self.zk.stop()
                 self.zk.close()
-                
-            # Close middleware resources
             if self.mw_obj and hasattr(self.mw_obj, 'cleanup'):
                 self.mw_obj.cleanup()
-                
             self.logger.info("Cleanup complete")
-            
         except Exception as e:
             self.logger.error(f"Error during cleanup: {e}")
 
     def dump_zk_nodes(self):
-        """ Debug method to dump ZooKeeper node structure """
+        """Debug method to dump ZooKeeper node structure."""
         self.logger.info("Current ZooKeeper nodes:")
-
         def print_tree(path, level=0):
             try:
                 children = self.zk.get_children(path)
@@ -524,11 +540,10 @@ class DiscoveryAppln:
                 self.logger.info(f"{'  ' * level}|- {child} {f'({data})' if data else ''}")
                 print_tree(child_path, level + 1)
         print_tree("/")
-        
 
-###################################
+########################################
 # Parse command line arguments
-###################################
+########################################
 def parseCmdLineArgs():
     parser = argparse.ArgumentParser(description="Discovery Service")
     parser.add_argument("-p", "--port", type=int, default=5555, help="Port number to run Discovery Service")
@@ -538,10 +553,9 @@ def parseCmdLineArgs():
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, choices=[10,20,30,40,50], help="Logging level")
     return parser.parse_args()
 
-
-###################################
+########################################
 # Main function
-###################################
+########################################
 def main():
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
