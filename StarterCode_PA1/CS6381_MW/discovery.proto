@@ -27,6 +27,7 @@ enum Status {
     STATUS_SUCCESS = 1;
     STATUS_FAILURE = 2;
     STATUS_CHECK_AGAIN = 3;   // when the server is not ready to provide info as yet
+    STATUS_NOT_PRIMARY = 4;   // when the instance is a backup and not the active primary
 }
 
 // define an enum of all message types supported on a discovery service.

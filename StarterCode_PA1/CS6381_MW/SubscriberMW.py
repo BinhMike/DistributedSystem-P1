@@ -1,257 +1,332 @@
-###############################################
-#
-# Author: Aniruddha Gokhale
-# Vanderbilt University
-#
-# Purpose: Skeleton/Starter code for the subscriber middleware code
-#
-# Created: Spring 2023
-#
-###############################################
-
-# Designing the logic is left as an exercise for the student. Please see the
-# PublisherMW.py file as to how the middleware side of things are constructed
-# and accordingly design things for the subscriber side of things.
-#
-# Remember that the subscriber middleware does not do anything on its own.
-# It must be invoked by the application level logic. This middleware object maintains
-# the ZMQ sockets and knows how to talk to Discovery service, etc.
-#
-# Here is what this middleware should do
-# (1) it must maintain the ZMQ sockets, one in the REQ role to talk to the Discovery service
-# and one in the SUB role to receive topic data
-# (2) It must, on behalf of the application logic, register the subscriber application with the
-# discovery service. To that end, it must use the protobuf-generated serialization code to
-# send the appropriate message with the contents to the discovery service.
-# (3) On behalf of the subscriber appln, it must use the ZMQ setsockopt method to subscribe to all the
-# user-supplied topics of interest. 
-# (4) Since it is a receiver, the middleware object will maintain a poller and even loop waiting for some
-# subscription to show up (or response from Discovery service).
-# (5) On receipt of a subscription, determine which topic it is and let the application level
-# handle the incoming data. To that end, you may need to make an upcall to the application-level
-# object.
-#
-
 import os
-import sys
 import time
-import logging
 import zmq
-import configparser
-from CS6381_MW import discovery_pb2
+import logging
 import csv
+import traceback
+import threading
+from CS6381_MW import discovery_pb2
 
 class SubscriberMW:
-    ########################################
-    # Constructor
-    ########################################
     def __init__(self, logger):
         self.logger = logger
-        self.req = None  # REQ socket for Discovery Service communication
-        self.sub = None  # SUB socket for receiving topics
+        self.req = None  # REQ socket for Discovery communication
+        self.sub = None  # SUB socket for topic subscriptions
+        self.heartbeat_socket = None  # PUSH socket for load balancer heartbeats
         self.poller = None  # Poller for async event handling
-        self.upcall_obj = None  # Application logic handle
-        self.handle_events = True  # Event loop flag
-        self.topiclist = None
-        # Add config parser
-        self.config = configparser.ConfigParser()
-        self.config.read('config.ini')
-        self.dissemination = self.config['Dissemination']['Strategy']
+        self.upcall_obj = None  # Handle to application logic
+        self.discovery_addr = None  # Discovery address from ZooKeeper
+        self.connected_publishers = set()  # Track connected publishers
+        self.zk = None  # ZooKeeper client reference
+        self.topics_to_groups = {}  # Track topic to group mapping
+        self.context = None  # ZMQ context
+        self.lb_heartbeat_thread = None  # Thread for sending heartbeats
+        self.keep_sending_heartbeats = False  # Control heartbeat thread
+        
+        # Paths for ZooKeeper structure
+        self.zk_paths = {
+            "discovery_leader": "/discovery/leader",
+            "publishers": "/publishers", 
+            "brokers": "/brokers",
+            "subscribers": "/subscribers",
+            "load_balancers": "/load_balancers"
+        }
 
-    ########################################
-    # Configure Middleware
-    ########################################
-    def configure(self, args):
+    def configure(self, discovery_addr, zk_client=None):
         ''' Initialize the Subscriber Middleware '''
         try:
             self.logger.info("SubscriberMW::configure")
 
-            # Subscriber does not bind to a port, only connects
-            self.addr = args.discovery  # Discovery service address
+            self.discovery_addr = discovery_addr
+            self.zk = zk_client  # Store ZooKeeper client reference if provided
 
-            # Initialize ZMQ context and sockets
-            context = zmq.Context()
+            self.context = zmq.Context()
             self.poller = zmq.Poller()
-            self.req = context.socket(zmq.REQ)  # Request socket for Discovery Service
-            self.sub = context.socket(zmq.SUB)  # Subscriber socket for topics
+            self.req = self.context.socket(zmq.REQ)  # Request socket for Discovery
+            self.sub = self.context.socket(zmq.SUB)  # Subscriber socket for topics
 
-            # Register REQ socket with the poller (expecting Discovery responses)
             self.poller.register(self.req, zmq.POLLIN)
             self.poller.register(self.sub, zmq.POLLIN)
 
-            # Connect to Discovery Service
-            connect_str = "tcp://" + args.discovery
-            self.req.connect(connect_str)
-            self.logger.info(f"SubscriberMW::configure - Connected to Discovery at {connect_str}")
+            self.connect_to_discovery(self.discovery_addr)
 
         except Exception as e:
+            self.logger.error(f"SubscriberMW::configure - Error: {str(e)}")
+            self.logger.error(f"Stack trace: {traceback.format_exc()}")
             raise e
 
-    ########################################
-    # Event Loop
-    ########################################
-    def event_loop(self, timeout=None):
+    def set_upcall_handle(self, upcall_obj):
+        """ Assigns an upcall handle to the application layer """
+        self.upcall_obj = upcall_obj
+
+    def connect_to_discovery(self, discovery_addr):
+        ''' Connects to Discovery '''
+        # Extract the address part if a lease expiry is appended
+        if "|" in discovery_addr:
+            discovery_addr = discovery_addr.split("|")[0]
+        self.logger.info(f"SubscriberMW::connect_to_discovery - Connecting to Discovery at {discovery_addr}")
+
+        # Only disconnect if we have a previous connection
+        if self.discovery_addr and self.req:
+            try:
+                self.logger.info(f"Disconnecting from previous Discovery at {self.discovery_addr}")
+                self.req.disconnect(f"tcp://{self.discovery_addr}")
+            except zmq.error.ZMQError as e:
+                self.logger.warning(f"Failed to disconnect from {self.discovery_addr}: {str(e)}")
+
+        # Connect to new address
+        try:
+            self.req.connect(f"tcp://{discovery_addr}")
+            self.discovery_addr = discovery_addr
+            self.logger.info(f"Successfully connected to Discovery at {discovery_addr}")
+        except Exception as e:
+            self.logger.error(f"Failed to connect to Discovery at {discovery_addr}: {str(e)}")
+            raise e
+
+    def event_loop(self, timeout=1000):
         ''' Run the event loop waiting for messages from Discovery or Publishers '''
         try:
             self.logger.info("SubscriberMW::event_loop - running")
 
-            while self.handle_events:
+            while True:
                 events = dict(self.poller.poll(timeout=timeout))
 
                 if not events:
-                    timeout = self.upcall_obj.invoke_operation()  # Timeout call to application
+                    timeout = self.upcall_obj.invoke_operation()
                 elif self.req in events:
-                    timeout = self.handle_reply()  # Handle response from Discovery
+                    timeout = self.handle_reply()
                 elif self.sub in events:
-                    self.handle_subscription()  # Handle received topic data
+                    self.handle_subscription()
                 else:
-                    raise Exception("Unknown event after poll")
+                    raise Exception("Unknown event in event loop")
 
         except Exception as e:
             raise e
 
-    ########################################
-    # Handle Discovery Service Replies
-    ########################################
     def handle_reply(self):
+        ''' Handle response from Discovery '''
         try:
             self.logger.info("SubscriberMW::handle_reply")
-            
-            # Receive response from Discovery
+
             bytes_received = self.req.recv()
             disc_resp = discovery_pb2.DiscoveryResp()
             disc_resp.ParseFromString(bytes_received)
-            
+
             if disc_resp.msg_type == discovery_pb2.TYPE_REGISTER:
-                timeout = self.upcall_obj.register_response(disc_resp.register_resp)
-            elif disc_resp.msg_type == discovery_pb2.TYPE_ISREADY:
-                timeout = self.upcall_obj.isready_response(disc_resp.isready_resp)
+                return self.upcall_obj.register_response(disc_resp.register_resp)
             elif disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC:
-                # Make upcall to application layer with lookup response
-
-                ## see if broker address is parsed correctly
-                self.logger.debug(f"Lookup response broker info: {disc_resp.lookup_resp.broker}")
-
-                timeout = self.upcall_obj.lookup_response(disc_resp.lookup_resp)
+                # Store virtual group info from Discovery response
+                if disc_resp.lookup_resp.publishers:
+                    for pub in disc_resp.lookup_resp.publishers:
+                        if ":" in pub.id and "grp=" in pub.id:
+                            # Extract group info from ID (format: "pub_name:grp=X")
+                            parts = pub.id.split(":")
+                            if len(parts) > 1 and "grp=" in parts[-1]:
+                                group_id = int(parts[-1].split("=")[1])
+                                # Add to our topic-to-group mapping
+                                for topic in self.current_topics:
+                                    self.topics_to_groups[topic] = group_id
+                
+                return self.upcall_obj.lookup_response(disc_resp.lookup_resp)
             else:
                 raise ValueError(f"Unhandled response type: {disc_resp.msg_type}")
-                
-            return timeout
-                
+
         except Exception as e:
             raise e
 
-    ########################################
-    # Register with Discovery Service
-    ########################################
     def register(self, name, topiclist):
         ''' Register the subscriber with the Discovery Service '''
         try:
             self.logger.info("SubscriberMW::register")
-            # Store topiclist for later use
-            self.topiclist = topiclist
 
-            # Populate registration request
-            reg_info = discovery_pb2.RegistrantInfo()
-            reg_info.id = name
+            reg_info = discovery_pb2.RegistrantInfo(id=name)
+            register_req = discovery_pb2.RegisterReq(role=discovery_pb2.ROLE_SUBSCRIBER, info=reg_info)
+            register_req.topiclist.extend(topiclist)
 
-            register_req = discovery_pb2.RegisterReq()
-            register_req.role = discovery_pb2.ROLE_SUBSCRIBER
-            register_req.info.CopyFrom(reg_info)
-            register_req.topiclist[:] = topiclist
+            disc_req = discovery_pb2.DiscoveryReq(msg_type=discovery_pb2.TYPE_REGISTER, register_req=register_req)
 
-            disc_req = discovery_pb2.DiscoveryReq()
-            disc_req.msg_type = discovery_pb2.TYPE_REGISTER
-            disc_req.register_req.CopyFrom(register_req)
-
-            # Serialize and send request
             self.req.send(disc_req.SerializeToString())
 
+            # Register in ZooKeeper if available
+            if self.zk:
+                self.register_in_zookeeper(name)
+
         except Exception as e:
             raise e
-
-    ########################################
-    # Check if the Discovery service is ready
-    #
-    # Sends the is_ready message and waits for a response.
-    ########################################
-    def is_ready(self):
-        ''' Check if the system is ready via Discovery Service '''
-
+            
+    def register_in_zookeeper(self, name):
+        """Register subscriber in ZooKeeper for discovery by others"""
+        if not self.zk:
+            self.logger.warning("SubscriberMW::register_in_zookeeper - No ZooKeeper client available")
+            return
+            
         try:
-            self.logger.info("SubscriberMW::is_ready")
-
-            # Build an IsReady request
-            self.logger.debug("SubscriberMW::is_ready - populate the nested IsReady msg")
-            isready_req = discovery_pb2.IsReadyReq()  # Empty message
-            self.logger.debug("SubscriberMW::is_ready - done populating nested IsReady msg")
-
-            # Build the outer DiscoveryReq message
-            self.logger.debug("SubscriberMW::is_ready - build the outer DiscoveryReq message")
-            disc_req = discovery_pb2.DiscoveryReq()
-            disc_req.msg_type = discovery_pb2.TYPE_ISREADY
-            disc_req.isready_req.CopyFrom(isready_req)
-            self.logger.debug("SubscriberMW::is_ready - done building the outer message")
-
-            # Serialize the message
-            buf2send = disc_req.SerializeToString()
-            self.logger.debug(f"SubscriberMW::is_ready - sending serialized buffer: {buf2send}")
-
-            # Send the request to Discovery
-            self.logger.debug("SubscriberMW::is_ready - sending request to Discovery service")
-            self.req.send(buf2send)
-
-            # Now the event loop will wait for the response
-            self.logger.info("SubscriberMW::is_ready - request sent, waiting for reply")
-
+            # Ensure the subscribers path exists
+            sub_path = self.zk_paths["subscribers"]
+            if not self.zk.exists(sub_path):
+                self.zk.ensure_path(sub_path)
+                
+            # Create or update the subscriber's node with its info
+            sub_node = f"{sub_path}/{name}"
+            
+            # Create node with empty data (topics are managed via the Discovery service)
+            if self.zk.exists(sub_node):
+                self.zk.delete(sub_node)
+                
+            self.zk.create(sub_node, b"", ephemeral=True)
+            self.logger.info(f"SubscriberMW::register_in_zookeeper - Registered in ZooKeeper at {sub_node}")
+            
         except Exception as e:
-            raise e
+            self.logger.error(f"SubscriberMW::register_in_zookeeper - Failed: {str(e)}")
 
-    def lookup_publishers(self, topiclist):
+    def lookup_publishers(self, topics):
+        """Lookup publishers for topics of interest"""
         try:
             self.logger.info("SubscriberMW::lookup_publishers")
             
-            # Create lookup request
+            # Store the current topics being looked up
+            self.current_topics = topics
+            
             lookup_req = discovery_pb2.LookupPubByTopicReq()
-            lookup_req.topiclist[:] = topiclist
+            lookup_req.topiclist.extend(topics)
             
-            # Create discovery request
-            disc_req = discovery_pb2.DiscoveryReq()
-            disc_req.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC
-            disc_req.lookup_req.CopyFrom(lookup_req)
-            
-            # Send request
+            # Create and send discovery request
+            disc_req = discovery_pb2.DiscoveryReq(
+                msg_type=discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC,
+                lookup_req=lookup_req
+            )
             self.req.send(disc_req.SerializeToString())
             
         except Exception as e:
+            self.logger.error(f"Error in lookup_publishers: {str(e)}")
             raise e
 
-    ########################################
-    # Subscribe to Topics
-    ########################################
-    def subscribe_to_topics(self, pub_address, topiclist):
-        ''' Connect to publisher and subscribe to topics '''
+    def lookup_broker_for_topic(self, topic):
+        """Find the appropriate broker for a specific topic using ONLY the group-based structure"""
+        if not self.zk:
+            self.logger.warning("SubscriberMW::lookup_broker_for_topic - No ZooKeeper client available")
+            return None
+            
         try:
-            self.logger.info(f"SubscriberMW::subscribe_to_topics - Connecting to {pub_address}")
-
-            # Connect to publisher
-            self.sub.connect(pub_address)
-
-            # Subscribe to topics
-            if not topiclist:  # Broker part
-                self.sub.setsockopt_string(zmq.SUBSCRIBE, "")
-                self.logger.info(f"SubscriberMW::subscribe_to_topics - Connected to Broker, subscribing to all topics")
-            else: # publisher
-                for topic in topiclist:
-                    self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
-                    self.logger.info(f"Subscribed to topic: {topic}")
-            return 0
+            broker_path = self.zk_paths["brokers"]
+            self.logger.info(f"SubscriberMW::lookup_broker_for_topic - Looking for broker groups under {broker_path}")
+            
+            # Check if the brokers path exists
+            if not self.zk.exists(broker_path):
+                self.logger.warning(f"Broker path {broker_path} does not exist in ZooKeeper")
+                return None
+            
+            # Get all broker groups
+            groups = self.zk.get_children(broker_path)
+            # Filter out non-group nodes 
+            groups = [group for group in groups if group.startswith("group")]
+            
+            if not groups:
+                self.logger.warning(f"No broker groups found under {broker_path}")
+                return None
+                
+            self.logger.info(f"Found broker groups: {groups}")
+            
+            # First, try to find a group that matches our topic's group (if available)
+            if topic in self.topics_to_groups:
+                group_id = self.topics_to_groups[topic]
+                group_name = f"group{group_id}"
+                
+                if group_name in groups:
+                    # Try to connect to this specific group's leader
+                    leader_path = f"{broker_path}/{group_name}/leader"
+                    if self.zk.exists(leader_path):
+                        data, _ = self.zk.get(leader_path)
+                        broker_info = data.decode()
+                        
+                        # Handle format with lease expiry
+                        if "|" in broker_info:
+                            broker_info = broker_info.split("|")[0]
+                            
+                        self.logger.info(f"Found matching broker group {group_name} for topic {topic}, leader at {broker_info}")
+                        return broker_info
+            
+            # Otherwise, try any available broker group
+            for group_name in groups:
+                leader_path = f"{broker_path}/{group_name}/leader"
+                if self.zk.exists(leader_path):
+                    data, _ = self.zk.get(leader_path)
+                    broker_info = data.decode()
+                    
+                    # Handle format with lease expiry
+                    if "|" in broker_info:
+                        broker_info = broker_info.split("|")[0]
+                        
+                    self.logger.info(f"Using broker from group {group_name} at {broker_info} for topic {topic}")
+                    return broker_info
+            
+            # If we still haven't found a broker, log an error
+            self.logger.error("No broker leaders found in any group")
+            return None
+            
         except Exception as e:
-            raise e
+            self.logger.error(f"Error looking up broker for topic {topic}: {str(e)}")
+            return None
 
-    ########################################
-    # Handle Incoming Subscription Messages
-    ########################################
+    def subscribe_to_topics(self, pub_address_or_topics, topics=None):
+        """Subscribe to topics with the publisher/load balancer.
+        
+        This method supports two calling styles:
+        - subscribe_to_topics(topics) - traditional style
+        - subscribe_to_topics(pub_address, topics) - new style for load balancer
+        
+        Args:
+            pub_address_or_topics: Either the address of the publisher or the topic list
+            topics: List of topics (or None if first param contains topics)
+        """
+        try:
+            # Check which calling style is being used
+            if topics is None:
+                # Traditional calling style: subscribe_to_topics(topics)
+                topics_to_subscribe = pub_address_or_topics
+                # Use the already connected publisher
+            else:
+                # New calling style: subscribe_to_topics(pub_address, topics)
+                pub_address = pub_address_or_topics
+                topics_to_subscribe = topics
+                
+                # Connect to the publisher/load balancer
+                self.logger.info(f"Connecting to publisher at {pub_address}")
+                
+                # Check if the address already has the tcp:// prefix
+                if pub_address.startswith("tcp://"):
+                    connection_url = pub_address
+                else:
+                    connection_url = f"tcp://{pub_address}"
+                    
+                self.sub.connect(connection_url)
+            
+            # Subscribe to all topics
+            for topic in topics_to_subscribe:
+                topic_bytes = topic.encode()
+                self.logger.debug(f"Subscribing to topic: {topic}")
+                self.sub.setsockopt(zmq.SUBSCRIBE, topic_bytes)
+                
+            self.logger.info(f"Subscribed to {len(topics_to_subscribe)} topics")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error subscribing to topics: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return False
+
+    def send_heartbeats(self):
+        """Send heartbeats periodically to the load balancer"""
+        try:
+            self.logger.info("SubscriberMW::send_heartbeats - Starting heartbeat thread")
+            while self.keep_sending_heartbeats:
+                self.heartbeat_socket.send_multipart([b"HEARTBEAT"])
+                time.sleep(1)  # Send heartbeat every second
+        except Exception as e:
+            self.logger.error(f"Error in send_heartbeats: {str(e)}")
+        finally:
+            self.logger.info("SubscriberMW::send_heartbeats - Stopping heartbeat thread")
+
     def handle_subscription(self):
         try:
             self.logger.info("SubscriberMW::handle_subscription")
@@ -282,15 +357,32 @@ class SubscriberMW:
             
         except Exception as e:
             raise e
-
-    ########################################
-    # Set Upcall Handle
-    ########################################
-    def set_upcall_handle(self, upcall_obj):
-        self.upcall_obj = upcall_obj
-
-    ########################################
-    # Disable Event Loop
-    ########################################
-    def disable_event_loop(self):
-        self.handle_events = False
+            
+    def cleanup(self):
+        """Clean up resources before shutdown"""
+        try:
+            self.logger.info("SubscriberMW::cleanup - Cleaning up resources")
+            
+            # Stop heartbeat thread
+            self.keep_sending_heartbeats = False
+            if self.lb_heartbeat_thread:
+                self.lb_heartbeat_thread.join()
+            
+            # Close ZMQ sockets
+            if self.sub:
+                self.sub.close()
+                
+            if self.req:
+                self.req.close()
+                
+            if self.heartbeat_socket:
+                self.heartbeat_socket.close()
+                
+            # ZMQ context cleanup
+            if self.context:
+                self.context.term()
+                
+            # Note: We don't close the ZooKeeper client here as it's managed by the application
+                
+        except Exception as e:
+            self.logger.error(f"SubscriberMW::cleanup - Error: {str(e)}")
