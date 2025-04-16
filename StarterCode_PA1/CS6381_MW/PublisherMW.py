@@ -55,6 +55,7 @@ class PublisherMW:
             self.poller.register(self.req, zmq.POLLIN)
             self.req.connect(f"tcp://{self.discovery_addr}")
             
+
             # Socket for disseminating topics
             self.pub = self.context.socket(zmq.PUB)
             self.pub.bind(f"tcp://*:{self.port}")
