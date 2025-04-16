@@ -181,21 +181,41 @@ class PublisherMW:
         except Exception as e:
             raise e
 
-    def disseminate (self, id, topic, data):
+    def disseminate(self, id, topic, data):
         try:
-            self.logger.info ("PublisherMW::disseminate")
+            self.logger.info("PublisherMW::disseminate")
+            max_retries = 3
+            retry_count = 0
 
-            # Now use the protobuf logic to encode the info and send it.  But for now
-            # we are simply sending the string to make sure dissemination is working.
-            timestamp = time.time()  # add time stamp
-            send_str = f"{topic}:{timestamp}:{data}"  
-            self.logger.info (f"PublisherMW::disseminate - {send_str}")
+            while retry_count < max_retries:
+                try:
+                    timestamp = time.time()  # add time stamp
+                    send_str = f"{topic}:{timestamp}:{data}"  
+                    self.logger.info(f"PublisherMW::disseminate - {send_str}")
 
-            # send the info as bytes. See how we are providing an encoding of utf-8
-            self.pub.send (bytes(send_str, "utf-8"))
+                    # send the info as bytes
+                    self.pub.send(bytes(send_str, "utf-8"), zmq.NOBLOCK)
+                    self.logger.info("PublisherMW::disseminate complete")
+                    return True
 
-            self.logger.info ("PublisherMW::disseminate complete")
+                except zmq.error.Again:
+                    # Socket would block, retry after a short delay
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        self.logger.warning(f"Publication would block, retrying ({retry_count}/{max_retries})")
+                        time.sleep(0.1 * retry_count)  # Exponential backoff
+                    continue
+                    
+                except Exception as e:
+                    self.logger.error(f"Unexpected error in disseminate: {str(e)}")
+                    raise e
+
+            if retry_count >= max_retries:
+                self.logger.error("Failed to publish after maximum retries")
+                return False
+
         except Exception as e:
+            self.logger.error(f"Error in disseminate: {str(e)}")
             raise e
 
     def set_upcall_handle(self, upcall_obj):

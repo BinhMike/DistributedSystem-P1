@@ -233,7 +233,7 @@ def run():
     cleanup_thread.start()
     
     # Wait for cleanup with a timeout
-    cleanup_thread.join(timeout=15)  # Wait up to 15 seconds for cleanup
+    cleanup_thread.join(timeout=4)  # Wait up to 15 seconds for cleanup
     if cleanup_thread.is_alive():
         print("Warning: Cleanup taking too long, forcing exit")
     

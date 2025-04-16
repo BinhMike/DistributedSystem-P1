@@ -44,6 +44,20 @@ class BrokerMW():
         self.port = None
         self.is_primary = is_primary  # Flag indicating if this is the primary broker
         self.socket_lock = threading.Lock()  # Lock for thread-safe socket operations
+        self.subscriptions = {}  # Map of topics to subscriber identities
+        
+        # Initialize recent messages cache for deduplication
+        self.recent_messages = set()
+        
+        # Store last notification time to avoid tight loop
+        self._last_notify_time = 0
+        
+        # Initialize load balancer connection attributes
+        self.using_lb = False    # Flag to indicate if we're using a load balancer
+        self.lb_socket = None    # Socket for communication with load balancer
+        self.lb_addr = None      # Load balancer address
+        self.lb_port = None      # Load balancer port
+        self.group_name = None   # Broker group name
         
     ########################################
     # Configure Middleware
@@ -241,31 +255,71 @@ class BrokerMW():
     def connect_to_lb(self, lb_addr, lb_port, group_name):
         """Connect to the load balancer for managed message routing"""
         try:
+            # If we're already connected to this LB, just return
+            if hasattr(self, 'using_lb') and self.using_lb and hasattr(self, 'lb_addr') and hasattr(self, 'lb_port'):
+                if self.lb_addr == lb_addr and self.lb_port == lb_port:
+                    self.logger.info(f"Already connected to LB at {lb_addr}:{lb_port}")
+                    return True
+                    
             self.logger.info(f"BrokerMW::connect_to_lb - Connecting to LB at {lb_addr}:{lb_port}")
             
-            # Create a special dealer socket for load balancer communication
-            self.lb_socket = self.create_socket(zmq.DEALER)
+            # For PULL socket on LB side, we need a PUB socket
+            if not hasattr(self, 'lb_socket') or self.lb_socket is None:
+                self.lb_socket = self.create_socket(zmq.PUB)
             
-            # Set socket identity to the group name to help load balancer routing
-            self.lb_socket.setsockopt_string(zmq.IDENTITY, group_name)
+            # Set reasonable timeouts
+            self.lb_socket.setsockopt(zmq.LINGER, 1000)
+            self.lb_socket.setsockopt(zmq.SNDTIMEO, 5000)
             
             # Connect to load balancer
             lb_endpoint = f"tcp://{lb_addr}:{lb_port}"
             self.lb_socket.connect(lb_endpoint)
             
-            # Add to poller
-            self.poller.register(self.lb_socket, zmq.POLLIN)
-            
-            # Store group name for load balancer identification
+            # Store group name and LB info for identification
             self.group_name = group_name
+            self.lb_addr = lb_addr
+            self.lb_port = int(lb_port)
             
             # Mark that we're using load balancer mode
             self.using_lb = True
+            
+            # Test connection
+            try:
+                test_msg = f"{group_name}_BROKER_ONLINE".encode()
+                self.logger.info(f"Sending test message to LB: {test_msg}")
+                self.lb_socket.send(test_msg)
+                self.logger.info("Test message sent to LB")
+            except Exception as e:
+                self.logger.warning(f"Failed to send test message to LB: {str(e)}")
+                # Continue anyway - non-critical
             
             self.logger.info(f"BrokerMW::connect_to_lb - Connected to LB for group {group_name}")
             return True
         except Exception as e:
             self.logger.error(f"BrokerMW::connect_to_lb - Error connecting to LB: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return False
+
+    ########################################
+    # Check Load Balancer Connection
+    ########################################
+    def check_lb_connection(self):
+        """Check if we're still connected to load balancer"""
+        if not self.using_lb:
+            return True  # Not using LB, so no connection issues
+            
+        if not hasattr(self, 'lb_socket') or self.lb_socket is None:
+            self.logger.warning("LB socket not initialized")
+            self.using_lb = False
+            return False
+            
+        try:
+            # Send a heartbeat to LB
+            test_msg = f"{self.group_name}_BROKER_HEARTBEAT".encode()
+            self.lb_socket.send(test_msg, zmq.NOBLOCK)
+            return True
+        except Exception as e:
+            self.logger.warning(f"LB connection may be down: {str(e)}")
             return False
 
     ########################################
@@ -346,9 +400,67 @@ class BrokerMW():
             if hasattr(self, 'replication_listener') and self.replication_listener in events:
                 self._handle_replication_message()
                 
+            # Add handling for load balancer socket
+            if hasattr(self, 'lb_socket') and self.lb_socket in events:
+                self._handle_lb_message()
+                
         except Exception as e:
             self.logger.error(f"BrokerMW::event_loop - Exception: {str(e)}")
             self.logger.error(f"BrokerMW::event_loop - Traceback: {traceback.format_exc()}")
+
+    def _handle_lb_message(self):
+        """Handle messages from load balancer"""
+        try:
+            message = self.lb_socket.recv_multipart()
+            # Log the full message for debugging
+            msg_str = []
+            for m in message:
+                if isinstance(m, bytes):
+                    try:
+                        msg_str.append(m.decode())
+                    except:
+                        msg_str.append(f"<binary {len(m)} bytes>")
+                else:
+                    msg_str.append(str(m))
+            
+            self.logger.info(f"BrokerMW::_handle_lb_message - Received: {msg_str}")
+            
+            if len(message) < 2:
+                self.logger.warning("Received invalid message from load balancer (too short)")
+                return
+                
+            subscriber_identity = message[0]  # Subscriber's identity frame
+            command = message[1]
+            
+            # Handle subscription command
+            if command == b"SUBSCRIBE" and len(message) >= 3:
+                topic = message[2].decode() if isinstance(message[2], bytes) else str(message[2])
+                self.logger.info(f"Received subscription request for topic '{topic}' from subscriber {subscriber_identity}")
+                
+                # Track subscription by topic
+                if topic not in self.subscriptions:
+                    self.subscriptions[topic] = set()
+                self.subscriptions[topic].add(subscriber_identity)
+                
+                # Send acknowledgment back through the load balancer
+                try:
+                    self.logger.info(f"Sending subscription ACK for topic '{topic}' back to subscriber")
+                    self.lb_socket.send_multipart([subscriber_identity, b"OK", f"Subscribed to {topic} at broker".encode()])
+                    self.logger.info(f"ACK sent for topic '{topic}'")
+                except Exception as e:
+                    self.logger.error(f"Failed to send ACK for topic '{topic}': {str(e)}")
+                    self.logger.error(traceback.format_exc())
+            else:
+                self.logger.warning(f"Received unknown command: {command}")
+                try:
+                    # Send error response
+                    self.lb_socket.send_multipart([subscriber_identity, b"ERROR", b"Unknown command"])
+                except Exception as e:
+                    self.logger.error(f"Failed to send error response: {str(e)}")
+                
+        except Exception as e:
+            self.logger.error(f"Error in _handle_lb_message: {str(e)}")
+            self.logger.error(traceback.format_exc())
 
     def _handle_publisher_message(self):
         """Handle messages from publishers"""
@@ -360,13 +472,11 @@ class BrokerMW():
         message_id = hash(message + str(time.time()))
         
         # Check if we've recently seen this message (implement a deduplication cache)
-        if hasattr(self, 'recent_messages') and message in self.recent_messages:
+        if message in self.recent_messages:
             self.logger.debug(f"BrokerMW::_handle_publisher_message - Ignoring duplicate message on topic [{topic}]")
             return
         
         # Store message in recent cache
-        if not hasattr(self, 'recent_messages'):
-            self.recent_messages = set()
         self.recent_messages.add(message)
         # Limit cache size to prevent memory issues
         if len(self.recent_messages) > 1000:
@@ -382,10 +492,21 @@ class BrokerMW():
             
             # Replicate to follower brokers
             self._replicate_message(message)
+            
+            # If we're using a load balancer and have specific subscriptions to track,
+            # send message to load balancer for selective forwarding
+            if hasattr(self, 'lb_socket') and topic in self.subscriptions:
+                try:
+                    # Send to each subscriber that's subscribed to this topic
+                    for subscriber_id in self.subscriptions[topic]:
+                        self.lb_socket.send_multipart([subscriber_id, topic.encode(), message.encode()])
+                        self.logger.debug(f"Forwarded message on topic '{topic}' to subscriber {subscriber_id} via load balancer")
+                except Exception as e:
+                    self.logger.error(f"Error forwarding to subscribers via load balancer: {str(e)}")
         
         # Let application know we processed something, but avoid tight loop
         # Only notify application occasionally to prevent rapid re-polling
-        if not hasattr(self, '_last_notify_time') or time.time() - self._last_notify_time > 0.1:
+        if time.time() - self._last_notify_time > 0.1:
             self._notify_application()
             self._last_notify_time = time.time()
 
@@ -435,7 +556,7 @@ class BrokerMW():
             self.logger.info("BrokerMW::cleanup - Cleaning up resources")
             
             # Make sure we're no longer primary and remove from ZK
-            if hasattr(self, 'is_primary') and self.is_primary:
+            if self.is_primary:
                 self._update_publisher_registration(False)
                 self.is_primary = False
             
@@ -455,14 +576,19 @@ class BrokerMW():
             if hasattr(self, 'replication_listener') and self.replication_listener:
                 self.safe_socket_close(self.replication_listener)
                 self.replication_listener = None
+                
+            # Add cleanup for load balancer socket
+            if hasattr(self, 'lb_socket') and self.lb_socket:
+                self.safe_socket_close(self.lb_socket)
+                self.lb_socket = None
         
             # Terminate ZMQ context
-            if hasattr(self, 'context') and self.context:
+            if self.context:
                 self.context.term()
                 self.context = None
             
             # Add explicit ZooKeeper cleanup
-            if hasattr(self, 'zk') and self.zk:
+            if self.zk:
                 self.logger.info("BrokerMW::cleanup - Closing ZooKeeper connection")
                 self.zk.stop()
                 self.zk.close()
@@ -486,7 +612,7 @@ class BrokerMW():
             self.ensure_path_exists(broker_base_path)
             
             # Use group name from args directly instead of parsing from name
-            if hasattr(self, 'args') and hasattr(self.args, 'group'):
+            if hasattr(self.args, 'group'):
                 group_name = self.args.group
                 self.logger.info(f"BrokerMW::register - Using group name from args: {group_name}")
             else:
@@ -509,9 +635,18 @@ class BrokerMW():
             replicas_path = f"{group_path}/replicas"
             self.ensure_path_exists(replicas_path)
             
-            # Register this broker as a replica with clean address format (no extra data)
-            replica_node = f"{replicas_path}/{self.addr}:{self.port}"  # Use address as node name for load balancer
-            address_str = f"{self.addr}:{self.port}"  # Clean format
+            # Register this broker as a replica with additional metadata
+            replica_node = f"{replicas_path}/{self.addr}:{self.port}"
+            
+            # Include more detailed information in the replica node
+            # This helps subscribers with direct connections if needed
+            role = "primary" if self.is_primary else "replica"
+            address_str = f"{self.addr}:{self.port}:{role}"
+            
+            # If we have group information, include it
+            if hasattr(self, 'group_name') and self.group_name:
+                address_str += f"|group={self.group_name}"
+                
             self.zk_update_node(replica_node, address_str, ephemeral=True)
             self.logger.info(f"BrokerMW::register - Registered as replica at {replica_node} with data {address_str}")
             
@@ -535,10 +670,15 @@ class BrokerMW():
             broker_as_pub_node = f"{self.publisher_path}/{self.broker_name}"
             
             if register:
-                # Register as a publisher
-                address_str = f"{self.addr}:{self.port}"
+                # Register as a publisher with extra metadata to help subscribers
+                # Include role and group info in the registration data
+                if hasattr(self, 'group_name'):
+                    address_str = f"{self.addr}:{self.port}|group={self.group_name}"
+                else:
+                    address_str = f"{self.addr}:{self.port}"
+                
                 self.zk_update_node(broker_as_pub_node, address_str, ephemeral=True)
-                self.logger.info(f"BrokerMW::_update_publisher_registration - Registered as publisher: {broker_as_pub_node}")
+                self.logger.info(f"BrokerMW::_update_publisher_registration - Registered as publisher: {broker_as_pub_node} with data {address_str}")
             else:
                 # Remove publisher registration
                 self.zk_delete_node(broker_as_pub_node)

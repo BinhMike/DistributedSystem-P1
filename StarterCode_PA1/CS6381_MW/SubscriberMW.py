@@ -3,6 +3,8 @@ import time
 import zmq
 import logging
 import csv
+import traceback
+import threading
 from CS6381_MW import discovery_pb2
 
 class SubscriberMW:
@@ -10,17 +12,21 @@ class SubscriberMW:
         self.logger = logger
         self.req = None  # REQ socket for Discovery communication
         self.sub = None  # SUB socket for topic subscriptions
+        self.heartbeat_socket = None  # PUSH socket for load balancer heartbeats
         self.poller = None  # Poller for async event handling
         self.upcall_obj = None  # Handle to application logic
         self.discovery_addr = None  # Discovery address from ZooKeeper
         self.connected_publishers = set()  # Track connected publishers
         self.zk = None  # ZooKeeper client reference
         self.topics_to_groups = {}  # Track topic to group mapping
+        self.context = None  # ZMQ context
+        self.lb_heartbeat_thread = None  # Thread for sending heartbeats
+        self.keep_sending_heartbeats = False  # Control heartbeat thread
         
         # Paths for ZooKeeper structure
         self.zk_paths = {
             "discovery_leader": "/discovery/leader",
-            "publishers": "/publishers",
+            "publishers": "/publishers", 
             "brokers": "/brokers",
             "subscribers": "/subscribers",
             "load_balancers": "/load_balancers"
@@ -34,10 +40,10 @@ class SubscriberMW:
             self.discovery_addr = discovery_addr
             self.zk = zk_client  # Store ZooKeeper client reference if provided
 
-            context = zmq.Context()
+            self.context = zmq.Context()
             self.poller = zmq.Poller()
-            self.req = context.socket(zmq.REQ)  # Request socket for Discovery
-            self.sub = context.socket(zmq.SUB)  # Subscriber socket for topics
+            self.req = self.context.socket(zmq.REQ)  # Request socket for Discovery
+            self.sub = self.context.socket(zmq.SUB)  # Subscriber socket for topics
 
             self.poller.register(self.req, zmq.POLLIN)
             self.poller.register(self.sub, zmq.POLLIN)
@@ -45,6 +51,8 @@ class SubscriberMW:
             self.connect_to_discovery(self.discovery_addr)
 
         except Exception as e:
+            self.logger.error(f"SubscriberMW::configure - Error: {str(e)}")
+            self.logger.error(f"Stack trace: {traceback.format_exc()}")
             raise e
 
     def set_upcall_handle(self, upcall_obj):
@@ -203,22 +211,6 @@ class SubscriberMW:
             broker_path = self.zk_paths["brokers"]
             self.logger.info(f"SubscriberMW::lookup_broker_for_topic - Looking for broker groups under {broker_path}")
             
-            # First check if load balancers exist - preferred connection method
-            lb_path = self.zk_paths["load_balancers"]
-            if self.zk.exists(lb_path):
-                lb_nodes = self.zk.get_children(lb_path)
-                if lb_nodes:
-                    # Get the first load balancer
-                    lb_node_path = f"{lb_path}/{lb_nodes[0]}"
-                    data, _ = self.zk.get(lb_node_path)
-                    if data:
-                        lb_info = data.decode().split(":")
-                        if len(lb_info) >= 3:  # format is addr:pub_port:sub_port
-                            lb_addr = lb_info[0]
-                            lb_sub_port = lb_info[2]
-                            self.logger.info(f"Found load balancer at {lb_addr}:{lb_sub_port} for topic {topic}")
-                            return f"{lb_addr}:{lb_sub_port}"
-            
             # Check if the brokers path exists
             if not self.zk.exists(broker_path):
                 self.logger.warning(f"Broker path {broker_path} does not exist in ZooKeeper")
@@ -276,30 +268,64 @@ class SubscriberMW:
             self.logger.error(f"Error looking up broker for topic {topic}: {str(e)}")
             return None
 
-    def subscribe_to_topics(self, publisher_addr, topics):
-        """Connect to a publisher and subscribe to topics"""
+    def subscribe_to_topics(self, pub_address_or_topics, topics=None):
+        """Subscribe to topics with the publisher/load balancer.
+        
+        This method supports two calling styles:
+        - subscribe_to_topics(topics) - traditional style
+        - subscribe_to_topics(pub_address, topics) - new style for load balancer
+        
+        Args:
+            pub_address_or_topics: Either the address of the publisher or the topic list
+            topics: List of topics (or None if first param contains topics)
+        """
         try:
-            self.logger.info(f"SubscriberMW::subscribe_to_topics - {publisher_addr}, topics: {topics}")
-            
-            # Extract just the address part if there's topic mapping data
-            if publisher_addr.startswith("tcp://") and "|" in publisher_addr:
-                clean_addr = publisher_addr.split("|")[0]
-                self.logger.info(f"SubscriberMW::subscribe_to_topics - Extracted address {clean_addr} from publisher data")
-                publisher_addr = clean_addr
-            
-            # Connect if not already connected
-            if publisher_addr not in self.connected_publishers:
-                self.sub.connect(publisher_addr)
-                self.connected_publishers.add(publisher_addr)
+            # Check which calling style is being used
+            if topics is None:
+                # Traditional calling style: subscribe_to_topics(topics)
+                topics_to_subscribe = pub_address_or_topics
+                # Use the already connected publisher
+            else:
+                # New calling style: subscribe_to_topics(pub_address, topics)
+                pub_address = pub_address_or_topics
+                topics_to_subscribe = topics
                 
-            # Subscribe to each topic
-            for topic in topics:
-                self.sub.setsockopt_string(zmq.SUBSCRIBE, topic)
-                self.logger.info(f"Subscribed to topic: {topic}")
+                # Connect to the publisher/load balancer
+                self.logger.info(f"Connecting to publisher at {pub_address}")
                 
+                # Check if the address already has the tcp:// prefix
+                if pub_address.startswith("tcp://"):
+                    connection_url = pub_address
+                else:
+                    connection_url = f"tcp://{pub_address}"
+                    
+                self.sub.connect(connection_url)
+            
+            # Subscribe to all topics
+            for topic in topics_to_subscribe:
+                topic_bytes = topic.encode()
+                self.logger.debug(f"Subscribing to topic: {topic}")
+                self.sub.setsockopt(zmq.SUBSCRIBE, topic_bytes)
+                
+            self.logger.info(f"Subscribed to {len(topics_to_subscribe)} topics")
+            return True
+            
         except Exception as e:
-            self.logger.error(f"Failed to subscribe: {str(e)}")
-            raise e
+            self.logger.error(f"Error subscribing to topics: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return False
+
+    def send_heartbeats(self):
+        """Send heartbeats periodically to the load balancer"""
+        try:
+            self.logger.info("SubscriberMW::send_heartbeats - Starting heartbeat thread")
+            while self.keep_sending_heartbeats:
+                self.heartbeat_socket.send_multipart([b"HEARTBEAT"])
+                time.sleep(1)  # Send heartbeat every second
+        except Exception as e:
+            self.logger.error(f"Error in send_heartbeats: {str(e)}")
+        finally:
+            self.logger.info("SubscriberMW::send_heartbeats - Stopping heartbeat thread")
 
     def handle_subscription(self):
         try:
@@ -337,12 +363,24 @@ class SubscriberMW:
         try:
             self.logger.info("SubscriberMW::cleanup - Cleaning up resources")
             
+            # Stop heartbeat thread
+            self.keep_sending_heartbeats = False
+            if self.lb_heartbeat_thread:
+                self.lb_heartbeat_thread.join()
+            
             # Close ZMQ sockets
             if self.sub:
                 self.sub.close()
                 
             if self.req:
                 self.req.close()
+                
+            if self.heartbeat_socket:
+                self.heartbeat_socket.close()
+                
+            # ZMQ context cleanup
+            if self.context:
+                self.context.term()
                 
             # Note: We don't close the ZooKeeper client here as it's managed by the application
                 

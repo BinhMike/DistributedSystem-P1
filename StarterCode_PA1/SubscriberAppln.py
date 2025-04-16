@@ -14,6 +14,7 @@ class SubscriberAppln:
         self.discovery_addr = None
         self.name = None
         self.topiclist = None  # Will be initialized using TopicSelector
+        self.dissemination_strategy = None  # Will be set during configuration
         
         # ZooKeeper paths
         self.zk_paths = {
@@ -30,6 +31,13 @@ class SubscriberAppln:
         self.logger.info("SubscriberAppln::configure")
         self.name = args.name
 
+        # Read configuration file to determine dissemination strategy
+        import configparser
+        config = configparser.ConfigParser()
+        config.read(args.config if hasattr(args, 'config') and args.config else "config.ini")
+        self.dissemination_strategy = config.get("Dissemination", "Strategy", fallback="Direct")
+        self.logger.info(f"Dissemination strategy: {self.dissemination_strategy}")
+        
         # Initialize topic list using TopicSelector
         ts = TopicSelector()
         self.topiclist = ts.interest(args.num_topics)  # Get random topics
@@ -147,16 +155,37 @@ class SubscriberAppln:
         try:
             self.logger.info("SubscriberAppln::lookup_response")
             
+            # In viaBroker mode, we should always connect to load balancers first
+            # This ensures we follow the proper architecture
+            if hasattr(self, 'dissemination_strategy') and self.dissemination_strategy == "ViaBroker":
+                self.logger.info("ViaBroker mode detected, prioritizing load balancer connection")
+                # Always try to connect to load balancers first in viaBroker mode
+                if self._try_connect_to_load_balancer():
+                    self.logger.info("Successfully connected to load balancer, skipping direct connections")
+                    return None
+            
             # Check if we got any publishers/brokers
             if not lookup_resp.publishers:
-                self.logger.error("No publishers/brokers found")
-                # Try to connect to brokers directly through the nested structure
+                self.logger.info("No publishers/brokers found in discovery response")
+                # Try to connect to brokers directly as a fallback
                 self._try_connect_to_brokers()
                 return 1
 
-            # Check if any of the responses are brokers by looking for group ID in the name
-            broker_publishers = [pub for pub in lookup_resp.publishers if ":" in pub.id and "grp=" in pub.id]
-            non_broker_publishers = [pub for pub in lookup_resp.publishers if ":" not in pub.id or "grp=" not in pub.id]
+            # First, attempt to detect brokers based on ID format
+            # Either by group identifier or by broker name prefix
+            broker_publishers = []
+            normal_publishers = []
+            
+            for pub in lookup_resp.publishers:
+                # If it has a group identifier or starts with "broker", consider it a broker
+                if ((":" in pub.id and "grp=" in pub.id) or 
+                    pub.id.startswith("broker") or 
+                    "broker" in pub.id.lower()):
+                    broker_publishers.append(pub)
+                else:
+                    normal_publishers.append(pub)
+            
+            broker_connected = False
             
             # If broker publishers are available, prefer them over direct publishers
             if broker_publishers:
@@ -166,17 +195,20 @@ class SubscriberAppln:
                         pub_address = f"tcp://{pub.addr}:{pub.port}"
                         self.logger.info(f"Connecting to broker at {pub_address} (ID: {pub.id})")
                         self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
-            # Otherwise use direct publishers
-            elif non_broker_publishers:
-                self.logger.info(f"Using direct publisher mode with {len(non_broker_publishers)} publishers")
-                for pub in non_broker_publishers:
+                        broker_connected = True
+            
+            # If no brokers connected, use direct publishers
+            if not broker_connected and normal_publishers:
+                self.logger.info(f"Using direct publisher mode with {len(normal_publishers)} publishers")
+                for pub in normal_publishers:
                     if pub.addr and pub.port:
                         pub_address = f"tcp://{pub.addr}:{pub.port}"
                         self.logger.info(f"Connecting to publisher at {pub_address}")
                         self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
             
-            # If no connections were made through discovery, try direct ZooKeeper lookup
-            if not broker_publishers and not non_broker_publishers:
+            # If we haven't connected to anything at this point, try direct ZooKeeper lookup
+            if not broker_connected and not normal_publishers:
+                self.logger.info("No successful connections made through discovery, trying direct ZooKeeper lookup")
                 self._try_connect_to_brokers()
             
             self.logger.info("Moving to LISTENING state")
@@ -185,6 +217,44 @@ class SubscriberAppln:
         except Exception as e:
             self.logger.error(f"Error in lookup_response: {str(e)}")
             raise e
+            
+    def _try_connect_to_load_balancer(self):
+        """Connect to a load balancer directly through ZooKeeper, used primarily for viaBroker mode"""
+        try:
+            # Check for load balancers registered in ZooKeeper
+            if self.zk.exists(self.zk_paths["load_balancers"]):
+                self.logger.info("Checking for load balancers in ZooKeeper")
+                lb_nodes = self.zk.get_children(self.zk_paths["load_balancers"])
+                
+                if lb_nodes:
+                    self.logger.info(f"Found load balancers: {lb_nodes}")
+                    for lb_node in lb_nodes:
+                        lb_path = f"{self.zk_paths['load_balancers']}/{lb_node}"
+                        data, _ = self.zk.get(lb_path)
+                        
+                        if data:
+                            # Load balancer data format is "addr:pub_port:sub_port"
+                            lb_info = data.decode()
+                            self.logger.info(f"Load balancer info: {lb_info}")
+                            
+                            parts = lb_info.split(":")
+                            if len(parts) >= 3:
+                                lb_addr = parts[0]
+                                lb_sub_port = parts[2]  # Use the subscriber port from the LB
+                                pub_address = f"tcp://{lb_addr}:{lb_sub_port}"
+                                
+                                self.logger.info(f"Connecting to load balancer at {pub_address}")
+                                self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
+                                return True  # Successfully connected to a load balancer
+            
+            self.logger.info("No load balancers found in ZooKeeper")
+            return False
+                
+        except Exception as e:
+            self.logger.error(f"Error connecting to load balancer: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return False
 
     def _try_connect_to_brokers(self):
         """Try to discover and connect to load balancers or brokers directly through ZooKeeper"""
@@ -290,7 +360,36 @@ class SubscriberAppln:
 
     def invoke_operation(self):
         # This method will be invoked on timeout or error
-        return None
+        # Add periodic logging to confirm we're still listening for messages
+        if hasattr(self, 'last_status_time') and time.time() - self.last_status_time < 10:
+            # Don't log too frequently - only every 10 seconds
+            return 1000  # Return timeout in ms
+            
+        self.last_status_time = time.time()
+        
+        # Log connection status
+        if hasattr(self.mw_obj, 'connected_publishers') and self.mw_obj.connected_publishers:
+            self.logger.info(f"SubscriberAppln::invoke_operation - Actively listening for messages from {len(self.mw_obj.connected_publishers)} sources")
+            for addr in self.mw_obj.connected_publishers:
+                is_lb = "load_balancer" in addr.lower() or ":700" in addr
+                source_type = "load balancer" if is_lb else "publisher/broker"
+                self.logger.info(f"  - Connected to {source_type} at {addr}")
+                
+            # If connected to a load balancer, check if broker groups exist in ZooKeeper
+            if any("load_balancer" in addr.lower() or ":700" in addr for addr in self.mw_obj.connected_publishers):
+                try:
+                    if self.zk and self.zk.exists(self.zk_paths["brokers"]):
+                        broker_groups = [g for g in self.zk.get_children(self.zk_paths["brokers"]) if g.startswith("group")]
+                        if broker_groups:
+                            self.logger.info(f"  - Load balancer is connected to broker groups: {broker_groups}")
+                        else:
+                            self.logger.warning("  - No broker groups found. Messages may not be received until brokers are started")
+                except Exception as e:
+                    self.logger.error(f"Error checking broker groups: {str(e)}")
+        else:
+            self.logger.warning("SubscriberAppln::invoke_operation - Not connected to any publishers or brokers")
+        
+        return 1000  # Return timeout in ms
 
     def cleanup(self):
         """Clean up resources"""
@@ -308,6 +407,7 @@ class SubscriberAppln:
                 
         except Exception as e:
             self.logger.error(f"Error during cleanup: {str(e)}")
+            raise e
 
 def parseCmdLineArgs():
     parser = argparse.ArgumentParser(description="Subscriber Application")
@@ -315,6 +415,7 @@ def parseCmdLineArgs():
     parser.add_argument("-T", "--num_topics", type=int, choices=range(1,10), default=1, help="Number of topics to subscribe")
     parser.add_argument("-z", "--zookeeper", default="localhost:2181", help="ZooKeeper host:port")
     parser.add_argument("-l", "--loglevel", type=int, default=logging.INFO, help="Logging level")
+    parser.add_argument("-c", "--config", help="Path to configuration file", default="config.ini")
     return parser.parse_args()
 
 def main():

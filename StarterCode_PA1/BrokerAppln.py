@@ -19,6 +19,7 @@ import socket
 import threading
 import zmq
 import random
+import traceback
 
 from kazoo.client import KazooClient
 from kazoo.recipe.lock import Lock
@@ -111,6 +112,15 @@ class BrokerAppln():
             # Register with discovery service
             self.mw_obj.register(self.name)
             
+            # Set up watch for load balancers (even if we don't find one now)
+            self._setup_lb_watch()
+            
+            # Try to find and connect to LB (this remains the same)
+            if self._find_and_connect_to_lb():
+                self.logger.info("Connected to load balancer")
+            else:
+                self.logger.info("No load balancer found, running in standalone mode")
+            
             self.logger.info("BrokerAppln::configure - completed")
         except Exception as e:
             self.logger.error(f"BrokerAppln::configure - Exception: {str(e)}")
@@ -158,66 +168,54 @@ class BrokerAppln():
             self.logger.info("No load balancer found, operating in standalone mode")
 
     def _find_and_connect_to_lb(self):
-        """Find and connect to a load balancer if available in ZooKeeper."""
+        """Find load balancer in ZooKeeper and connect to it"""
         try:
-            # Check if the load balancer node exists in ZooKeeper
-            lb_path = self.zk_paths["load_balancers"]
+            lb_path = "/load_balancers"
             if not self.zk.exists(lb_path):
-                self.logger.info("No load balancer path found in ZooKeeper")
+                self.logger.info("Load balancer path doesn't exist yet")
                 return False
-                
-            # Get all registered load balancers
+            
+            # Get list of load balancers
             lb_nodes = self.zk.get_children(lb_path)
             if not lb_nodes:
-                self.logger.info("No load balancers registered in ZooKeeper")
+                self.logger.info("No load balancer nodes found")
+                return False
+            
+            # Pick the first one
+            lb_node = lb_nodes[0]
+            lb_data_path = f"{lb_path}/{lb_node}"
+            
+            # Get load balancer connection info
+            if not self.zk.exists(lb_data_path):
+                self.logger.warning(f"Load balancer node {lb_node} disappeared")
                 return False
                 
-            # Use the first load balancer found
-            lb_node_path = f"{lb_path}/{lb_nodes[0]}"
-            lb_data, _ = self.zk.get(lb_node_path)
+            lb_data, _ = self.zk.get(lb_data_path)
+            if not lb_data:
+                self.logger.warning("Load balancer data is empty")
+                return False
+                
+            # Parse connection info
             lb_info = lb_data.decode().split(":")
-            
-            if len(lb_info) != 3:
+            if len(lb_info) < 3:
                 self.logger.error(f"Invalid load balancer data format: {lb_data.decode()}")
                 return False
                 
-            lb_addr, pub_port, sub_port = lb_info
-            self.logger.info(f"Found load balancer at {lb_addr} with ports {pub_port}/{sub_port}")
+            lb_addr, pub_port, sub_port = lb_info[0], lb_info[1], lb_info[2]
+            self.logger.info(f"Found load balancer at {lb_addr}:{pub_port}")
             
-            # Ensure proper broker group structure in ZooKeeper before connecting
-            group_path = f"{self.zk_paths['brokers']}/{self.group}"
-            self.zk.ensure_path(group_path)
-            
-            # Make sure replica registration is done properly
-            try:
-                replica_node = f"{self.replicas_path}/{self.broker_address}"
-                if not self.zk.exists(replica_node):
-                    self.zk.create(replica_node, self.broker_address.encode(), ephemeral=True)
-                    self.logger.info(f"Registered as replica at {replica_node}")
-            except Exception as e:
-                self.logger.warning(f"Error registering replica: {str(e)}")
-            
-            # Make sure leader node exists for load balancer to find
-            try:
-                if not self.zk.exists(self.leader_path) and self.is_primary:
-                    leader_data = f"{self.broker_address}|{time.time()+30}"
-                    self.zk.create(self.leader_path, leader_data.encode(), ephemeral=True)
-                    self.logger.info(f"Created leader node at {self.leader_path}")
-            except Exception as e:
-                self.logger.warning(f"Error creating leader node: {str(e)}")
-            
-            # Connect to the load balancer with the group name for proper routing
+            # Connect to load balancer
             result = self.mw_obj.connect_to_lb(lb_addr, int(pub_port), self.group)
-            
             if result:
                 self.logger.info(f"Successfully connected to load balancer at {lb_addr}:{pub_port}")
+                return True
             else:
-                self.logger.error(f"Failed to connect to load balancer at {lb_addr}:{pub_port}")
+                self.logger.error("Failed to connect to load balancer")
+                return False
                 
-            return result
-            
         except Exception as e:
-            self.logger.error(f"Error finding load balancer: {str(e)}")
+            self.logger.error(f"Error finding/connecting to load balancer: {str(e)}")
+            self.logger.error(traceback.format_exc())
             return False
 
     def _setup_replica_tracking(self):
@@ -296,9 +294,22 @@ class BrokerAppln():
         self.is_primary = True
         self.leader_start_time = time.time()
         self.logger.info(f"Instance {self.broker_address} became primary. Lease expires around {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(lease_expiry))}.")
-        # Pass the correct broker address for renewal data
-        self.start_lease_renewal(self.broker_address)
-        if self.mw_obj: self.mw_obj.update_primary_status(True)
+        
+        # Before passing to middleware, verify the leader node still exists
+        if self.zk.exists(self.leader_path):
+            # Pass the correct broker address for renewal data
+            self.start_lease_renewal(self.broker_address)
+            
+            # Explicitly set middleware to primary with extra logging 
+            if self.mw_obj:
+                self.logger.info(f"Setting middleware to primary status")
+                self.mw_obj.update_primary_status(True)
+                self.logger.info(f"Middleware primary status is now: {self.mw_obj.is_primary}")
+            else:
+                self.logger.error(f"Cannot set middleware primary status: middleware object is None")
+        else:
+            self.logger.error(f"Leader node disappeared during _become_primary! Not updating middleware.")
+            self.is_primary = False
 
     def _become_backup(self):
         """Handle backup role and watch for leader changes."""
@@ -576,6 +587,29 @@ class BrokerAppln():
 
         # After relinquishing, become a backup and watch for new leader
         self._become_backup()
+
+    def _setup_lb_watch(self):
+        """Set up a watch for load balancer nodes in ZooKeeper"""
+        try:
+            # Make sure the path exists
+            lb_path = "/load_balancers"
+            if not self.zk.exists(lb_path):
+                self.logger.info(f"Creating load balancer path in ZooKeeper: {lb_path}")
+                self.zk.ensure_path(lb_path)
+            
+            # Set up the watch function
+            @self.zk.ChildrenWatch(lb_path)
+            def watch_lb(children):
+                self.logger.info(f"Load balancers changed: {children}")
+                if children and not self.mw_obj.using_lb:
+                    self.logger.info("Load balancer detected after startup, attempting to connect")
+                    self._find_and_connect_to_lb()
+            
+            self.logger.info("Set up watch for load balancers")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error setting up load balancer watch: {str(e)}")
+            return False
 
     def driver(self):
         """Start the broker event loop."""

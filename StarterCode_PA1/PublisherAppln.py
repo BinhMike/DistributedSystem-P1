@@ -40,6 +40,7 @@ class PublisherAppln:
         self.logger = logger
         self.zk = None
         self.discovery_addr = None
+        self.using_broker_lb = False  # Track if we're using broker load balancer mode
         
         # ZooKeeper paths
         self.zk_paths = {
@@ -163,7 +164,13 @@ class PublisherAppln:
                 return None
 
             elif self.state == self.State.DISSEMINATE:
-                # Instead of running all iterations at once, just do one iteration per call
+                # Check load balancer health before publishing
+                if hasattr(self, 'using_broker_lb') and self.using_broker_lb:
+                    if not self._check_lb_health():
+                        self.logger.warning("Load balancer not healthy, waiting before publishing")
+                        return 1000  # Try again in 1 second
+
+                # Rest of the dissemination logic
                 self.logger.info("PublisherAppln::invoke_operation - Disseminating")
                 
                 # If we have iterations left, disseminate one batch of topics
@@ -178,7 +185,7 @@ class PublisherAppln:
                     
                     # Return a timeout based on the frequency (in milliseconds)
                     return int(1000/float(self.frequency))
-                
+
                 # If we're done with all iterations, complete
                 elif hasattr(self, 'current_iteration') and self.current_iteration >= self.iters:
                     self.logger.info("PublisherAppln::invoke_operation - Dissemination completed")
@@ -197,6 +204,16 @@ class PublisherAppln:
         except Exception as e:
             self.logger.error(f"Exception in invoke_operation: {e}")
             raise e
+
+    def _check_lb_health(self):
+        """Check if load balancer is healthy by verifying its ZooKeeper registration"""
+        try:
+            if self.zk and self.zk.exists(self.zk_paths["load_balancers"]):
+                lb_nodes = self.zk.get_children(self.zk_paths["load_balancers"])
+                return len(lb_nodes) > 0
+        except Exception as e:
+            self.logger.error(f"Error checking load balancer health: {e}")
+        return False
 
     def register_response(self, reg_resp):
         if reg_resp.status == discovery_pb2.Status.STATUS_SUCCESS:
@@ -218,6 +235,9 @@ class PublisherAppln:
                     # Update middleware with group mapping
                     if group_mapping and self.mw_obj:
                         self.mw_obj.update_group_mapping(group_mapping)
+                        # If we got a group mapping, we're using the broker load balancer
+                        self.using_broker_lb = True
+                        self.logger.info("Using broker load balancer mode")
                 except Exception as e:
                     self.logger.error(f"Error processing group mapping: {e}")
             
