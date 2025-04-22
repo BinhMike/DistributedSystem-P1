@@ -54,7 +54,8 @@ class BrokerMW():
         
         # Initialize load balancer connection attributes
         self.using_lb = False    # Flag to indicate if we're using a load balancer
-        self.lb_socket = None    # Socket for communication with load balancer
+        self.lb_push = None      # PUSH socket for communication with load balancer
+        self.lb_sub = None       # SUB socket for receiving subscription commands
         self.lb_addr = None      # Load balancer address
         self.lb_port = None      # Load balancer port
         self.group_name = None   # Broker group name
@@ -140,10 +141,17 @@ class BrokerMW():
                 self.logger.info(f"BrokerMW::subscribe_to_publishers - Found {len(publishers)} publishers: {publishers}")
                 
                 for pub_id in publishers:
+                    # skip our own broker-registration node
+                    if hasattr(self, 'broker_name') and pub_id == self.broker_name:
+                        continue
                     pub_node_path = f"{self.publisher_path}/{pub_id}"
                     if self.zk.exists(pub_node_path):
                         pub_data, _ = self.zk.get(pub_node_path)
-                        pub_address = pub_data.decode()
+                        data_str = pub_data.decode()
+                        # skip broker registrations (they include "group=")
+                        if "group=" in data_str:
+                            continue
+                        pub_address = data_str
                         
                         # Extract just the address part if there's topic mapping data
                         if "|" in pub_address:
@@ -176,10 +184,15 @@ class BrokerMW():
                 publishers = self.zk.get_children(self.publisher_path)
                 for pub_id in publishers:
                     try:
+                        if hasattr(self, 'broker_name') and pub_id == self.broker_name:
+                            continue
                         pub_node_path = f"{self.publisher_path}/{pub_id}"
                         if self.zk.exists(pub_node_path):
                             pub_data, _ = self.zk.get(pub_node_path)
-                            pub_address = pub_data.decode()
+                            data_str = pub_data.decode()
+                            if "group=" in data_str:
+                                continue
+                            pub_address = data_str
                             
                             # Extract just the address part if there's topic mapping data
                             if "|" in pub_address:
@@ -255,48 +268,44 @@ class BrokerMW():
     def connect_to_lb(self, lb_addr, lb_port, group_name):
         """Connect to the load balancer for managed message routing"""
         try:
-            # If we're already connected to this LB, just return
-            if hasattr(self, 'using_lb') and self.using_lb and hasattr(self, 'lb_addr') and hasattr(self, 'lb_port'):
-                if self.lb_addr == lb_addr and self.lb_port == lb_port:
-                    self.logger.info(f"Already connected to LB at {lb_addr}:{lb_port}")
-                    return True
-                    
             self.logger.info(f"BrokerMW::connect_to_lb - Connecting to LB at {lb_addr}:{lb_port}")
             
-            # For PULL socket on LB side, we need a PUB socket
-            if not hasattr(self, 'lb_socket') or self.lb_socket is None:
-                self.lb_socket = self.create_socket(zmq.PUB)
+            # 1. PUSH socket for sending messages to load balancer's PULL socket
+            self.lb_push = self.create_socket(zmq.PUSH)
+            self.lb_push.setsockopt(zmq.LINGER, 1000)
+            self.lb_push.setsockopt(zmq.SNDTIMEO, 5000)
+            lb_push_endpoint = f"tcp://{lb_addr}:{lb_port}"
+            self.lb_push.connect(lb_push_endpoint)
+            self.logger.info(f"Connected PUSH socket to LB at {lb_push_endpoint}")
             
-            # Set reasonable timeouts
-            self.lb_socket.setsockopt(zmq.LINGER, 1000)
-            self.lb_socket.setsockopt(zmq.SNDTIMEO, 5000)
-            
-            # Connect to load balancer
-            lb_endpoint = f"tcp://{lb_addr}:{lb_port}"
-            self.lb_socket.connect(lb_endpoint)
+            # 2. SUB socket for receiving subscription commands from LB's XPUB
+            # Get subscriber port (should be lb_port+1 based on BrokerLB defaults)
+            lb_sub_port = int(lb_port) + 1
+            self.lb_sub = self.create_socket(zmq.SUB)
+            self.lb_sub.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all topics
+            lb_sub_endpoint = f"tcp://{lb_addr}:{lb_sub_port}"
+            self.lb_sub.connect(lb_sub_endpoint)
+            self.poller.register(self.lb_sub, zmq.POLLIN)
+            self.logger.info(f"Connected SUB socket to LB at {lb_sub_endpoint}")
             
             # Store group name and LB info for identification
             self.group_name = group_name
             self.lb_addr = lb_addr
             self.lb_port = int(lb_port)
-            
-            # Mark that we're using load balancer mode
             self.using_lb = True
             
-            # Test connection
+            # Send a test message to confirm connection
             try:
                 test_msg = f"{group_name}_BROKER_ONLINE".encode()
-                self.logger.info(f"Sending test message to LB: {test_msg}")
-                self.lb_socket.send(test_msg)
+                self.lb_push.send(test_msg)
                 self.logger.info("Test message sent to LB")
             except Exception as e:
-                self.logger.warning(f"Failed to send test message to LB: {str(e)}")
+                self.logger.warning(f"Test message send failed: {str(e)}")
                 # Continue anyway - non-critical
             
-            self.logger.info(f"BrokerMW::connect_to_lb - Connected to LB for group {group_name}")
             return True
         except Exception as e:
-            self.logger.error(f"BrokerMW::connect_to_lb - Error connecting to LB: {str(e)}")
+            self.logger.error(f"BrokerMW::connect_to_lb - Error: {str(e)}")
             self.logger.error(traceback.format_exc())
             return False
 
@@ -308,15 +317,15 @@ class BrokerMW():
         if not self.using_lb:
             return True  # Not using LB, so no connection issues
             
-        if not hasattr(self, 'lb_socket') or self.lb_socket is None:
-            self.logger.warning("LB socket not initialized")
+        if not hasattr(self, 'lb_push') or self.lb_push is None:
+            self.logger.warning("LB PUSH socket not initialized")
             self.using_lb = False
             return False
             
         try:
             # Send a heartbeat to LB
             test_msg = f"{self.group_name}_BROKER_HEARTBEAT".encode()
-            self.lb_socket.send(test_msg, zmq.NOBLOCK)
+            self.lb_push.send(test_msg, zmq.NOBLOCK)
             return True
         except Exception as e:
             self.logger.warning(f"LB connection may be down: {str(e)}")
@@ -400,8 +409,8 @@ class BrokerMW():
             if hasattr(self, 'replication_listener') and self.replication_listener in events:
                 self._handle_replication_message()
                 
-            # Add handling for load balancer socket
-            if hasattr(self, 'lb_socket') and self.lb_socket in events:
+            # Use the lb_sub socket instead of the old lb_socket
+            if hasattr(self, 'lb_sub') and self.lb_sub in events:
                 self._handle_lb_message()
                 
         except Exception as e:
@@ -411,7 +420,7 @@ class BrokerMW():
     def _handle_lb_message(self):
         """Handle messages from load balancer"""
         try:
-            message = self.lb_socket.recv_multipart()
+            message = self.lb_sub.recv_multipart()
             # Log the full message for debugging
             msg_str = []
             for m in message:
@@ -445,7 +454,7 @@ class BrokerMW():
                 # Send acknowledgment back through the load balancer
                 try:
                     self.logger.info(f"Sending subscription ACK for topic '{topic}' back to subscriber")
-                    self.lb_socket.send_multipart([subscriber_identity, b"OK", f"Subscribed to {topic} at broker".encode()])
+                    self.lb_push.send_multipart([subscriber_identity, b"OK", f"Subscribed to {topic} at broker".encode()])
                     self.logger.info(f"ACK sent for topic '{topic}'")
                 except Exception as e:
                     self.logger.error(f"Failed to send ACK for topic '{topic}': {str(e)}")
@@ -454,7 +463,7 @@ class BrokerMW():
                 self.logger.warning(f"Received unknown command: {command}")
                 try:
                     # Send error response
-                    self.lb_socket.send_multipart([subscriber_identity, b"ERROR", b"Unknown command"])
+                    self.lb_push.send_multipart([subscriber_identity, b"ERROR", b"Unknown command"])
                 except Exception as e:
                     self.logger.error(f"Failed to send error response: {str(e)}")
                 
@@ -495,11 +504,11 @@ class BrokerMW():
             
             # If we're using a load balancer and have specific subscriptions to track,
             # send message to load balancer for selective forwarding
-            if hasattr(self, 'lb_socket') and topic in self.subscriptions:
+            if hasattr(self, 'lb_push') and topic in self.subscriptions:
                 try:
                     # Send to each subscriber that's subscribed to this topic
                     for subscriber_id in self.subscriptions[topic]:
-                        self.lb_socket.send_multipart([subscriber_id, topic.encode(), message.encode()])
+                        self.lb_push.send_multipart([subscriber_id, topic.encode(), message.encode()])
                         self.logger.debug(f"Forwarded message on topic '{topic}' to subscriber {subscriber_id} via load balancer")
                 except Exception as e:
                     self.logger.error(f"Error forwarding to subscribers via load balancer: {str(e)}")
@@ -577,10 +586,14 @@ class BrokerMW():
                 self.safe_socket_close(self.replication_listener)
                 self.replication_listener = None
                 
-            # Add cleanup for load balancer socket
-            if hasattr(self, 'lb_socket') and self.lb_socket:
-                self.safe_socket_close(self.lb_socket)
-                self.lb_socket = None
+            # Add cleanup for load balancer sockets
+            if hasattr(self, 'lb_push') and self.lb_push:
+                self.safe_socket_close(self.lb_push)
+                self.lb_push = None
+            
+            if hasattr(self, 'lb_sub') and self.lb_sub:
+                self.safe_socket_close(self.lb_sub)
+                self.lb_sub = None
         
             # Terminate ZMQ context
             if self.context:

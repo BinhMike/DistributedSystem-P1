@@ -333,8 +333,9 @@ class SubscriberMW:
             
             # Receive published message
             message = self.sub.recv_string()
-            topic, time_sent, content = message.split(":", 2)  
-            time_sent = float(time_sent)  # parse timestamp
+            # Original message format: "topic:timestamp:content"
+            topic, time_sent_str, content = message.split(":", 2)  
+            time_sent = float(time_sent_str)  # parse timestamp
             time_received = time.time()  
 
             # Calculate latency
@@ -343,6 +344,11 @@ class SubscriberMW:
             # Pass to application layer
             self.upcall_obj.process_message(topic, content)
             
+            # Get subscriber name from upcall object if available
+            subscriber_name = "Unknown"
+            if self.upcall_obj and hasattr(self.upcall_obj, 'name'):
+                subscriber_name = self.upcall_obj.name
+
             # Save in CSV
             csv_filename = "subscriber_data.csv"
             file_exists = os.path.exists(csv_filename)
@@ -350,13 +356,18 @@ class SubscriberMW:
             with open(csv_filename, mode="a", newline="") as csv_file:
                 csv_writer = csv.writer(csv_file)
                 if not file_exists:
-                    csv_writer.writerow(["timestamp", "topic", "latency", "content"])  
-                csv_writer.writerow([time_received, topic, latency, content]) 
+                    # Add subscriber_name to header
+                    csv_writer.writerow(["timestamp", "subscriber_name", "topic", "latency", "content"])  
+                # Add subscriber_name to data row
+                csv_writer.writerow([time_received, subscriber_name, topic, latency, content]) 
 
-            self.logger.info(f"Data saved to {csv_filename}, Latency: {latency:.6f} s")
+            self.logger.info(f"Data saved to {csv_filename} for {subscriber_name}, Topic: {topic}, Latency: {latency:.6f} s")
             
         except Exception as e:
-            raise e
+            self.logger.error(f"Error handling subscription: {e}") # Log the error
+            self.logger.error(traceback.format_exc()) # Log traceback
+            # Decide if you want to re-raise or continue
+            # raise e # Re-raising might stop the event loop
             
     def cleanup(self):
         """Clean up resources before shutdown"""
