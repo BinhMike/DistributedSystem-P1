@@ -12,7 +12,6 @@ class SubscriberMW:
         self.logger = logger
         self.req = None  # REQ socket for Discovery communication
         self.sub = None  # SUB socket for topic subscriptions
-        self.heartbeat_socket = None  # PUSH socket for load balancer heartbeats
         self.poller = None  # Poller for async event handling
         self.upcall_obj = None  # Handle to application logic
         self.discovery_addr = None  # Discovery address from ZooKeeper
@@ -20,8 +19,6 @@ class SubscriberMW:
         self.zk = None  # ZooKeeper client reference
         self.topics_to_groups = {}  # Track topic to group mapping
         self.context = None  # ZMQ context
-        self.lb_heartbeat_thread = None  # Thread for sending heartbeats
-        self.keep_sending_heartbeats = False  # Control heartbeat thread
         
         # Paths for ZooKeeper structure
         self.zk_paths = {
@@ -315,18 +312,6 @@ class SubscriberMW:
             self.logger.error(traceback.format_exc())
             return False
 
-    def send_heartbeats(self):
-        """Send heartbeats periodically to the load balancer"""
-        try:
-            self.logger.info("SubscriberMW::send_heartbeats - Starting heartbeat thread")
-            while self.keep_sending_heartbeats:
-                self.heartbeat_socket.send_multipart([b"HEARTBEAT"])
-                time.sleep(1)  # Send heartbeat every second
-        except Exception as e:
-            self.logger.error(f"Error in send_heartbeats: {str(e)}")
-        finally:
-            self.logger.info("SubscriberMW::send_heartbeats - Stopping heartbeat thread")
-
     def handle_subscription(self):
         try:
             self.logger.info("SubscriberMW::handle_subscription")
@@ -374,20 +359,12 @@ class SubscriberMW:
         try:
             self.logger.info("SubscriberMW::cleanup - Cleaning up resources")
             
-            # Stop heartbeat thread
-            self.keep_sending_heartbeats = False
-            if self.lb_heartbeat_thread:
-                self.lb_heartbeat_thread.join()
-            
             # Close ZMQ sockets
             if self.sub:
                 self.sub.close()
                 
             if self.req:
                 self.req.close()
-                
-            if self.heartbeat_socket:
-                self.heartbeat_socket.close()
                 
             # ZMQ context cleanup
             if self.context:

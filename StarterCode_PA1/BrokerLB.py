@@ -31,7 +31,6 @@ class BrokerLoadBalancer:
         # Frontend sockets (facing clients)
         self.pub_frontend = None    # PULL socket for publishers
         self.sub_frontend = None    # XPUB socket for subscribers
-        self.sub_heartbeat = None   # PULL socket for subscriber heartbeats
         
         # Backend socket (facing brokers)
         self.backend = None         # XSUB socket for brokers
@@ -215,13 +214,6 @@ class BrokerLoadBalancer:
         self.sub_frontend = self.context.socket(zmq.XPUB) 
         self.sub_frontend.bind(f"tcp://*:{sub_port}")
         self.logger.info(f"Subscriber frontend bound to port {sub_port}")
-        
-        heartbeat_port = sub_port + 100
-        self.sub_heartbeat = self.context.socket(zmq.PULL)
-        self.sub_heartbeat.bind(f"tcp://*:{heartbeat_port}")
-        self.logger.info(f"Subscriber heartbeat socket bound to port {heartbeat_port}")
-        
-        self.heartbeat_port = heartbeat_port
     
     def _setup_backend_socket(self):
         """Set up backend socket to connect to broker instances."""
@@ -374,9 +366,6 @@ class BrokerLoadBalancer:
             backend_poller = zmq.Poller()
             backend_poller.register(self.backend, zmq.POLLIN)
             
-            heartbeat_poller = zmq.Poller()
-            heartbeat_poller.register(self.sub_heartbeat, zmq.POLLIN)
-            
             self.subscribers = {"count": 0, "identities": set()}
             
             # Track last status update time
@@ -458,15 +447,6 @@ class BrokerLoadBalancer:
                     except Exception as e:
                         self.logger.error(f"Error handling message from broker: {e}")
                 
-                # Check for heartbeat messages
-                events = dict(heartbeat_poller.poll(1))
-                if self.sub_heartbeat in events:
-                    try:
-                        message = self.sub_heartbeat.recv()
-                        self.logger.debug(f"Received heartbeat: raw={message}")
-                    except Exception as e:
-                        self.logger.error(f"Error processing heartbeat: {str(e)}")
-                
                 # Periodic status update
                 current_time = time.time()
                 if current_time - last_status_time > self.STATUS_UPDATE_INTERVAL:
@@ -501,9 +481,6 @@ class BrokerLoadBalancer:
             
         if hasattr(self, 'sub_frontend') and self.sub_frontend:
             self.sub_frontend.close()
-            
-        if hasattr(self, 'sub_heartbeat') and self.sub_heartbeat:
-            self.sub_heartbeat.close()
             
         if hasattr(self, 'backend') and self.backend:
             self.backend.close()

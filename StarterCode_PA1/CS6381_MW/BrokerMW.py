@@ -55,7 +55,6 @@ class BrokerMW():
         # Initialize load balancer connection attributes
         self.using_lb = False    # Flag to indicate if we're using a load balancer
         self.lb_push = None      # PUSH socket for communication with load balancer
-        self.lb_sub = None       # SUB socket for receiving subscription commands
         self.lb_addr = None      # Load balancer address
         self.lb_port = None      # Load balancer port
         self.group_name = None   # Broker group name
@@ -402,60 +401,6 @@ class BrokerMW():
         except Exception as e:
             self.logger.error(f"BrokerMW::event_loop - Exception: {str(e)}")
 
-    def _handle_lb_message(self):
-        """Handle messages from load balancer"""
-        try:
-            message = self.lb_sub.recv_multipart()
-            # Log the full message for debugging
-            msg_str = []
-            for m in message:
-                if isinstance(m, bytes):
-                    try:
-                        msg_str.append(m.decode())
-                    except:
-                        msg_str.append(f"<binary {len(m)} bytes>")
-                else:
-                    msg_str.append(str(m))
-            
-            self.logger.info(f"BrokerMW::_handle_lb_message - Received: {msg_str}")
-            
-            if len(message) < 2:
-                self.logger.warning("Received invalid message from load balancer (too short)")
-                return
-                
-            subscriber_identity = message[0]  # Subscriber's identity frame
-            command = message[1]
-            
-            # Handle subscription command
-            if command == b"SUBSCRIBE" and len(message) >= 3:
-                topic = message[2].decode() if isinstance(message[2], bytes) else str(message[2])
-                self.logger.info(f"Received subscription request for topic '{topic}' from subscriber {subscriber_identity}")
-                
-                # Track subscription by topic
-                if topic not in self.subscriptions:
-                    self.subscriptions[topic] = set()
-                self.subscriptions[topic].add(subscriber_identity)
-                
-                # Send acknowledgment back through the load balancer
-                try:
-                    self.logger.info(f"Sending subscription ACK for topic '{topic}' back to subscriber")
-                    self.lb_push.send_multipart([subscriber_identity, b"OK", f"Subscribed to {topic} at broker".encode()])
-                    self.logger.info(f"ACK sent for topic '{topic}'")
-                except Exception as e:
-                    self.logger.error(f"Failed to send ACK for topic '{topic}': {str(e)}")
-                    self.logger.error(traceback.format_exc())
-            else:
-                self.logger.warning(f"Received unknown command: {command}")
-                try:
-                    # Send error response
-                    self.lb_push.send_multipart([subscriber_identity, b"ERROR", b"Unknown command"])
-                except Exception as e:
-                    self.logger.error(f"Failed to send error response: {str(e)}")
-                
-        except Exception as e:
-            self.logger.error(f"Error in _handle_lb_message: {str(e)}")
-            self.logger.error(traceback.format_exc())
-
     def _handle_publisher_message(self):
         """Handle messages from publishers"""
         message = self.sub.recv_string()
@@ -486,17 +431,6 @@ class BrokerMW():
             
             # Replicate to follower brokers
             self._replicate_message(message)
-            
-            # If we're using a load balancer and have specific subscriptions to track,
-            # send message to load balancer for selective forwarding
-            if hasattr(self, 'lb_push') and topic in self.subscriptions:
-                try:
-                    # Send to each subscriber that's subscribed to this topic
-                    for subscriber_id in self.subscriptions[topic]:
-                        self.lb_push.send_multipart([subscriber_id, topic.encode(), message.encode()])
-                        self.logger.debug(f"Forwarded message on topic '{topic}' to subscriber {subscriber_id} via load balancer")
-                except Exception as e:
-                    self.logger.error(f"Error forwarding to subscribers via load balancer: {str(e)}")
         
         # Let application know we processed something, but avoid tight loop
         # Only notify application occasionally to prevent rapid re-polling
@@ -575,10 +509,6 @@ class BrokerMW():
             if hasattr(self, 'lb_push') and self.lb_push:
                 self.safe_socket_close(self.lb_push)
                 self.lb_push = None
-            
-            if hasattr(self, 'lb_sub') and self.lb_sub:
-                self.safe_socket_close(self.lb_sub)
-                self.lb_sub = None
         
             # Terminate ZMQ context
             if self.context:
