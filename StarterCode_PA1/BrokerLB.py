@@ -6,6 +6,7 @@ import signal
 import threading
 import traceback
 import zmq
+from collections import deque
 
 from kazoo.client import KazooClient
 
@@ -48,6 +49,10 @@ class BrokerLoadBalancer:
         # Signal handlers
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
+        
+        # For deduplication of broker messages
+        self._recent_hashes = deque(maxlen=10000)
+        self._hash_set = set()
     
     def configure(self, args):
         """
@@ -307,7 +312,10 @@ class BrokerLoadBalancer:
             
             # Find the appropriate broker group for this topic
             target_group = self.topic_to_group.get(topic, self.default_group)
-            self.logger.info(f"Routing {topic} subscription to broker group '{target_group}'")
+            self.logger.debug(
+                f"Routing subscription → raw={message}, "
+                f"topic='{topic}', subscribe={is_subscribe}, group='{target_group}'"
+            )
             
             # Forward the subscription to the appropriate broker
             if target_group in self.broker_groups:
@@ -378,6 +386,7 @@ class BrokerLoadBalancer:
             while True:
                 # Check frontend events
                 events = dict(frontend_poller.poll(100))  # Short timeout
+                self.logger.debug(f"Frontend poll fired sockets: {[sock for sock in events.keys()]}")
                 
                 # Handle publisher messages (PULL socket)
                 if self.pub_frontend in events:
@@ -388,14 +397,20 @@ class BrokerLoadBalancer:
                         if topic_end != -1:
                             topic = message[:topic_end].decode()
                             target_group = self.topic_to_group.get(topic, self.default_group)
-                            self.logger.debug(f"Routing message on topic '{topic}' to broker group '{target_group}'")
+                            self.logger.debug(
+                                f"Routing publisher msg → size={len(message)} bytes, "
+                                f"topic='{topic}', group='{target_group}', snippet='{message[:50]}'"
+                            )
                             
                             # Forward to backends using round-robin within target group
                             if target_group in self.broker_groups and self.broker_groups[target_group]:
                                 broker = self._get_next_broker_for_group(target_group)
                                 if broker:
                                     try:
-                                        self.logger.debug(f"Forwarding message to broker: {broker}")
+                                        self.logger.debug(
+                                            f"Forwarding to broker {broker} → size={len(message)} bytes, "
+                                            f"snippet='{message[:50]}'"
+                                        )
                                         # For XSUB socket, no need for multipart
                                         self.backend.send(message)
                                     except Exception as e:
@@ -423,18 +438,32 @@ class BrokerLoadBalancer:
                 if self.backend in events:
                     try:
                         message = self.backend.recv()
-                        self.logger.debug("Received message from broker")
-                        # Forward to subscribers
+                        h = hash(message)
+                        # Drop exact duplicates
+                        if h in self._hash_set:
+                            self.logger.debug(f"Ignoring duplicate msg hash={h}, snippet={message[:50]!r}")
+                            continue
+
+                        # Track it
+                        self._hash_set.add(h)
+                        self._recent_hashes.append(h)
+                        if len(self._recent_hashes) == self._recent_hashes.maxlen:
+                            old = self._recent_hashes.popleft()
+                            self._hash_set.remove(old)
+
+                        self.logger.debug(
+                            f"Forwarding unique msg hash={h} → size={len(message)} bytes, snippet={message[:50]!r}"
+                        )
                         self.sub_frontend.send(message)
                     except Exception as e:
-                        self.logger.error(f"Error handling message from broker: {str(e)}")
+                        self.logger.error(f"Error handling message from broker: {e}")
                 
                 # Check for heartbeat messages
                 events = dict(heartbeat_poller.poll(1))
                 if self.sub_heartbeat in events:
                     try:
                         message = self.sub_heartbeat.recv()
-                        self.logger.debug("Received heartbeat message")
+                        self.logger.debug(f"Received heartbeat: raw={message}")
                     except Exception as e:
                         self.logger.error(f"Error processing heartbeat: {str(e)}")
                 

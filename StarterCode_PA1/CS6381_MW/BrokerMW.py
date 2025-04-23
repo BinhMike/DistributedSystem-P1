@@ -278,16 +278,6 @@ class BrokerMW():
             self.lb_push.connect(lb_push_endpoint)
             self.logger.info(f"Connected PUSH socket to LB at {lb_push_endpoint}")
             
-            # 2. SUB socket for receiving subscription commands from LB's XPUB
-            # Get subscriber port (should be lb_port+1 based on BrokerLB defaults)
-            lb_sub_port = int(lb_port) + 1
-            self.lb_sub = self.create_socket(zmq.SUB)
-            self.lb_sub.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all topics
-            lb_sub_endpoint = f"tcp://{lb_addr}:{lb_sub_port}"
-            self.lb_sub.connect(lb_sub_endpoint)
-            self.poller.register(self.lb_sub, zmq.POLLIN)
-            self.logger.info(f"Connected SUB socket to LB at {lb_sub_endpoint}")
-            
             # Store group name and LB info for identification
             self.group_name = group_name
             self.lb_addr = lb_addr
@@ -409,13 +399,8 @@ class BrokerMW():
             if hasattr(self, 'replication_listener') and self.replication_listener in events:
                 self._handle_replication_message()
                 
-            # Use the lb_sub socket instead of the old lb_socket
-            if hasattr(self, 'lb_sub') and self.lb_sub in events:
-                self._handle_lb_message()
-                
         except Exception as e:
             self.logger.error(f"BrokerMW::event_loop - Exception: {str(e)}")
-            self.logger.error(f"BrokerMW::event_loop - Traceback: {traceback.format_exc()}")
 
     def _handle_lb_message(self):
         """Handle messages from load balancer"""
