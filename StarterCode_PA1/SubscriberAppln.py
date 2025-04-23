@@ -1,12 +1,23 @@
 import time
 import argparse
 import logging
+import traceback  # Import traceback
+from enum import Enum  # Import Enum
 from kazoo.client import KazooClient
 from topic_selector import TopicSelector  # Importing TopicSelector
 from CS6381_MW.SubscriberMW import SubscriberMW
 from CS6381_MW import discovery_pb2
 
 class SubscriberAppln:
+    # Add the State enum definition
+    class State(Enum):
+        INITIALIZE = 0,
+        CONFIGURE = 1,
+        REGISTER = 2,
+        LOOKUP = 3,  # Added LOOKUP state
+        RUNNING = 4,
+        COMPLETED = 5
+
     def __init__(self, logger):
         self.logger = logger
         self.mw_obj = None
@@ -15,7 +26,10 @@ class SubscriberAppln:
         self.name = None
         self.topiclist = None  # Will be initialized using TopicSelector
         self.dissemination_strategy = None  # Will be set during configuration
-        
+        self.state = self.State.INITIALIZE  # Initialize state
+        self.received_count = 0  # Track received messages
+        self.iters = 0  # Number of messages to receive (0 for infinite)
+
         # ZooKeeper paths
         self.zk_paths = {
             "discovery_leader": "/discovery/leader",
@@ -150,246 +164,120 @@ class SubscriberAppln:
             self.logger.error(f"Error locating primary: {str(e)}")
 
     def lookup_response(self, lookup_resp):
-        """ Subscribe to publishers/brokers that disseminate the selected topics """
-        """ Subscriber receive either publisher or broker address msg, which depends on discovery."""
+        """Handle the response for a lookup request"""
         try:
             self.logger.info("SubscriberAppln::lookup_response")
-            
-            # In viaBroker mode, we should always connect to load balancers first
-            # This ensures we follow the proper architecture
-            if hasattr(self, 'dissemination_strategy') and self.dissemination_strategy == "ViaBroker":
-                self.logger.info("ViaBroker mode detected, prioritizing load balancer connection")
-                # Always try to connect to load balancers first in viaBroker mode
-                if self._try_connect_to_load_balancer():
-                    self.logger.info("Successfully connected to load balancer, skipping direct connections")
-                    return None
-            
-            # Check if we got any publishers/brokers
+
+            # Check if any publishers/brokers were found
             if not lookup_resp.publishers:
-                self.logger.info("No publishers/brokers found in discovery response")
-                # Try to connect to brokers directly as a fallback
-                self._try_connect_to_brokers()
-                return 1
+                self.logger.warning("No publishers/brokers found for the requested topics.")
+                # Decide how to handle this - maybe retry lookup later?
+                return 10000 # Retry lookup after 10 seconds
 
-            # First, attempt to detect brokers based on ID format
-            # Either by group identifier or by broker name prefix
-            broker_publishers = []
-            normal_publishers = []
-            
-            for pub in lookup_resp.publishers:
-                # If it has a group identifier or starts with "broker", consider it a broker
-                if ((":" in pub.id and "grp=" in pub.id) or 
-                    pub.id.startswith("broker") or 
-                    "broker" in pub.id.lower()):
-                    broker_publishers.append(pub)
+            # Determine if we are in broker mode or direct publisher mode
+            # A simple heuristic: if the ID contains "broker", assume broker mode.
+            # A more robust approach might involve checking ZK paths or specific metadata.
+            is_broker_mode = any("broker" in pub.id.lower() for pub in lookup_resp.publishers)
+            is_lb_mode = any("lb_" in pub.id.lower() for pub in lookup_resp.publishers) # Check for load balancer
+
+            if is_lb_mode:
+                 self.logger.info("Load Balancer mode detected.")
+                 # Connect to the first load balancer found
+                 lb_info = lookup_resp.publishers[0] # Assuming only one LB for now
+                 lb_addr = f"{lb_info.addr}:{lb_info.port}"
+                 self.logger.info(f"Attempting to connect to Load Balancer at {lb_addr}")
+                 # Use the new subscribe method - it handles connection and filtering
+                 if self.mw_obj.subscribe(self.topiclist):
+                      self.logger.info(f"Successfully subscribed to topics via Load Balancer {lb_addr}")
+                      self.state = self.State.RUNNING
+                      return 0 # Success, proceed with normal operation timeout
+                 else:
+                      self.logger.error(f"Failed to subscribe via Load Balancer {lb_addr}")
+                      return 5000 # Retry connection/subscription
+
+            elif is_broker_mode:
+                self.logger.info(f"Broker mode detected with {len(lookup_resp.publishers)} brokers/groups found.")
+                # Use the new subscribe method - it handles ZK lookup, connection, and filtering
+                if self.mw_obj.subscribe(self.topiclist):
+                     self.logger.info("Successfully subscribed to topics via Brokers.")
+                     self.state = self.State.RUNNING
+                     return 0 # Success
                 else:
-                    normal_publishers.append(pub)
-            
-            broker_connected = False
-            
-            # If broker publishers are available, prefer them over direct publishers
-            if broker_publishers:
-                self.logger.info(f"Using broker mode with {len(broker_publishers)} brokers")
-                for pub in broker_publishers:
-                    if pub.addr and pub.port:
-                        pub_address = f"tcp://{pub.addr}:{pub.port}"
-                        self.logger.info(f"Connecting to broker at {pub_address} (ID: {pub.id})")
-                        self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
-                        broker_connected = True
-            
-            # If no brokers connected, use direct publishers
-            if not broker_connected and normal_publishers:
-                self.logger.info(f"Using direct publisher mode with {len(normal_publishers)} publishers")
-                for pub in normal_publishers:
-                    if pub.addr and pub.port:
-                        pub_address = f"tcp://{pub.addr}:{pub.port}"
-                        self.logger.info(f"Connecting to publisher at {pub_address}")
-                        self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
-            
-            # If we haven't connected to anything at this point, try direct ZooKeeper lookup
-            if not broker_connected and not normal_publishers:
-                self.logger.info("No successful connections made through discovery, trying direct ZooKeeper lookup")
-                self._try_connect_to_brokers()
-            
-            self.logger.info("Moving to LISTENING state")
-            return None
+                     self.logger.error("Failed to subscribe via Brokers.")
+                     return 5000 # Retry
+
+            else: # Direct Publisher mode
+                self.logger.info(f"Direct Publisher mode detected with {len(lookup_resp.publishers)} publishers found.")
+                connected_count = 0
+                for pub_info in lookup_resp.publishers:
+                    pub_addr = f"{pub_info.addr}:{pub_info.port}"
+                    # Use the new subscribe method - it handles connection and filtering
+                    # We subscribe to all topics with each publisher found in this simple model
+                    if self.mw_obj.subscribe(self.topiclist): # subscribe handles the connection logic now
+                         self.logger.info(f"Successfully subscribed to topics via Publisher {pub_addr}")
+                         connected_count +=1
+                    else:
+                         self.logger.warning(f"Failed to subscribe via Publisher {pub_addr}")
+
+                if connected_count > 0:
+                    self.state = self.State.RUNNING
+                    return 0 # Success
+                else:
+                    self.logger.error("Failed to connect to any publishers.")
+                    return 5000 # Retry
 
         except Exception as e:
-            self.logger.error(f"Error in lookup_response: {str(e)}")
-            raise e
-            
-    def _try_connect_to_load_balancer(self):
-        """Connect to a load balancer directly through ZooKeeper, used primarily for viaBroker mode"""
-        try:
-            # Check for load balancers registered in ZooKeeper
-            if self.zk.exists(self.zk_paths["load_balancers"]):
-                self.logger.info("Checking for load balancers in ZooKeeper")
-                lb_nodes = self.zk.get_children(self.zk_paths["load_balancers"])
-                
-                if lb_nodes:
-                    self.logger.info(f"Found load balancers: {lb_nodes}")
-                    for lb_node in lb_nodes:
-                        lb_path = f"{self.zk_paths['load_balancers']}/{lb_node}"
-                        data, _ = self.zk.get(lb_path)
-                        
-                        if data:
-                            # Load balancer data format is "addr:pub_port:sub_port"
-                            lb_info = data.decode()
-                            self.logger.info(f"Load balancer info: {lb_info}")
-                            
-                            parts = lb_info.split(":")
-                            if len(parts) >= 3:
-                                lb_addr = parts[0]
-                                lb_sub_port = parts[2]  # Use the subscriber port from the LB
-                                pub_address = f"tcp://{lb_addr}:{lb_sub_port}"
-                                
-                                self.logger.info(f"Connecting to load balancer at {pub_address}")
-                                self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
-                                return True  # Successfully connected to a load balancer
-            
-            self.logger.info("No load balancers found in ZooKeeper")
-            return False
-                
-        except Exception as e:
-            self.logger.error(f"Error connecting to load balancer: {str(e)}")
-            import traceback
+            self.logger.error(f"Error in lookup_response: {e}")
             self.logger.error(traceback.format_exc())
-            return False
+            return 5000 # Retry on error
 
-    def _try_connect_to_brokers(self):
-        """Try to discover and connect to load balancers or brokers directly through ZooKeeper"""
-        try:
-            # First, try to find and connect to load balancers
-            if self.zk.exists(self.zk_paths["load_balancers"]):
-                self.logger.info("Checking for load balancers in ZooKeeper")
-                lb_nodes = self.zk.get_children(self.zk_paths["load_balancers"])
-                
-                if lb_nodes:
-                    self.logger.info(f"Found load balancers: {lb_nodes}")
-                    for lb_node in lb_nodes:
-                        lb_path = f"{self.zk_paths['load_balancers']}/{lb_node}"
-                        data, _ = self.zk.get(lb_path)
-                        
-                        if data:
-                            # Load balancer data format is "addr:pub_port:sub_port"
-                            lb_info = data.decode()
-                            self.logger.info(f"Load balancer info: {lb_info}")
-                            
-                            parts = lb_info.split(":")
-                            if len(parts) >= 3:
-                                lb_addr = parts[0]
-                                lb_sub_port = parts[2]  # Use the subscriber port from the LB
-                                pub_address = f"tcp://{lb_addr}:{lb_sub_port}"
-                                
-                                self.logger.info(f"Connecting to load balancer at {pub_address}")
-                                self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)
-                                return  # Successfully connected to a load balancer
-            
-            # If no load balancer found, fall back to direct broker connection
-            self.logger.info("No load balancers found, trying direct broker connection")
-            
-            if not self.zk.exists(self.zk_paths["brokers"]):
-                self.logger.info("No broker groups found in ZooKeeper")
-                return
-                
-            # Find all broker groups
-            children = self.zk.get_children(self.zk_paths["brokers"])
-            # Filter out non-group nodes like 'leader', 'replicas', 'spawn_lock'
-            broker_groups = [child for child in children if child.startswith("group")] 
-            
-            if not broker_groups:
-                self.logger.info("No broker groups found under /brokers")
-                return
-                
-            self.logger.info(f"Found broker groups: {broker_groups}. Attempting direct connection.")
-                
-            for group in broker_groups:
-                group_path = f"{self.zk_paths['brokers']}/{group}"
-                leader_path = f"{group_path}/leader"
-                
-                # If this group has a leader, connect to it
-                if self.zk.exists(leader_path):
-                    self.logger.info(f"Checking leader for group {group} at {leader_path}")
-                    data = None
-                    retries = 3 # Try up to 3 times
-                    for attempt in range(retries):
-                        data, stat = self.zk.get(leader_path)
-                        if data:
-                            self.logger.debug(f"Got data on attempt {attempt+1} for {leader_path}")
-                            break # Got data, proceed
-                        else:
-                            self.logger.warning(f"Broker leader node {leader_path} exists but has no data (attempt {attempt+1}/{retries}). Retrying shortly...")
-                            if attempt < retries - 1:
-                                 time.sleep(0.2 * (attempt + 1)) # Exponential backoff delay
-                            else:
-                                 self.logger.error(f"Broker leader node {leader_path} still has no data after {retries} attempts. Skipping group {group}.")
-                                 continue
-                    
-                    # Check if data was successfully retrieved after retries
-                    if not data:
-                        continue # Skip to the next group if no data after retries
-
-                    # Decode and extract addr:port, handling potential lease info
-                    try:
-                        decoded_data = data.decode()
-                        broker_addr_port = decoded_data.split('|')[0]  # Extract addr:port part
-                    except Exception as decode_err:
-                         self.logger.error(f"Error decoding data from {leader_path}: {decode_err}. Data: {data}. Skipping.")
-                         continue
-
-                    # Add check for empty or invalid address format
-                    if not broker_addr_port or ':' not in broker_addr_port:
-                        self.logger.error(f"Invalid broker address data found in {leader_path}: '{broker_addr_port}'. Skipping.")
-                        continue
-                        
-                    pub_address = f"tcp://{broker_addr_port}"
-                    
-                    self.logger.info(f"Connecting directly to broker leader at {pub_address} for group {group}")
-                    self.mw_obj.subscribe_to_topics(pub_address, self.topiclist)                     
-                    
-        except Exception as e:
-            self.logger.error(f"Error connecting to load balancers or brokers: {str(e)}")
-            # Log detailed traceback for debugging
-            import traceback
-            self.logger.error(traceback.format_exc())
-
-    def process_message(self, topic, content):
-        """ Process received messages from publishers """
-        self.logger.info(f"SubscriberAppln::process_message - {topic}::{content}")
-        return None
+    def process_message(self, topic, content, latency):
+        """Process received messages (upcall from middleware)"""
+        self.logger.info(f"Received message for topic \'{topic}\': {content} (Latency: {latency:.6f}s)")
+        # Add any application-specific processing here
+        self.received_count += 1
+        if self.iters > 0 and self.received_count >= self.iters:
+             self.logger.info(f"Received {self.received_count} messages, completing.")
+             self.state = self.State.COMPLETED
 
     def invoke_operation(self):
-        # This method will be invoked on timeout or error
-        # Add periodic logging to confirm we're still listening for messages
-        if hasattr(self, 'last_status_time') and time.time() - self.last_status_time < 10:
-            # Don't log too frequently - only every 10 seconds
-            return 1000  # Return timeout in ms
-            
-        self.last_status_time = time.time()
-        
-        # Log connection status
-        if hasattr(self.mw_obj, 'connected_publishers') and self.mw_obj.connected_publishers:
-            self.logger.info(f"SubscriberAppln::invoke_operation - Actively listening for messages from {len(self.mw_obj.connected_publishers)} sources")
-            for addr in self.mw_obj.connected_publishers:
-                is_lb = "load_balancer" in addr.lower() or ":700" in addr
-                source_type = "load balancer" if is_lb else "publisher/broker"
-                self.logger.info(f"  - Connected to {source_type} at {addr}")
-                
-            # If connected to a load balancer, check if broker groups exist in ZooKeeper
-            if any("load_balancer" in addr.lower() or ":700" in addr for addr in self.mw_obj.connected_publishers):
-                try:
-                    if self.zk and self.zk.exists(self.zk_paths["brokers"]):
-                        broker_groups = [g for g in self.zk.get_children(self.zk_paths["brokers"]) if g.startswith("group")]
-                        if broker_groups:
-                            self.logger.info(f"  - Load balancer is connected to broker groups: {broker_groups}")
-                        else:
-                            self.logger.warning("  - No broker groups found. Messages may not be received until brokers are started")
-                except Exception as e:
-                    self.logger.error(f"Error checking broker groups: {str(e)}")
-        else:
-            self.logger.warning("SubscriberAppln::invoke_operation - Not connected to any publishers or brokers")
-        
-        return 1000  # Return timeout in ms
+        """ Invoke operations based on the current state """
+        try:
+            if self.state == self.State.REGISTER:
+                self.logger.info("SubscriberAppln::invoke_operation - Registering")
+                self.mw_obj.register(self.name, self.topiclist)
+                # We will transition state in the register_response callback
+                return None # Wait for response
+
+            elif self.state == self.State.LOOKUP:
+                self.logger.info("SubscriberAppln::invoke_operation - Looking up publishers/brokers")
+                self.mw_obj.lookup_publishers(self.topiclist)
+                # We will transition state in the lookup_response callback
+                return None # Wait for response
+
+            elif self.state == self.State.RUNNING:
+                # In the running state, we just wait for messages.
+                # The event loop timeout is handled by handle_subscription or handle_reply.
+                # We can return a default timeout here if needed, e.g., for periodic checks.
+                # self.logger.debug("SubscriberAppln::invoke_operation - Running, waiting for messages")
+                return 1000 # Default timeout while running
+
+            elif self.state == self.State.COMPLETED:
+                self.logger.info("SubscriberAppln::invoke_operation - Completed")
+                # Signal the middleware event loop to stop
+                self.mw_obj.disable_event_loop()
+                return None # No further timeout needed
+
+            else: # Includes INITIALIZE, CONFIGURE
+                 # These states should transition quickly, but return a short timeout just in case
+                 return 100
+
+        except Exception as e:
+            self.logger.error(f"Exception in invoke_operation: {e}")
+            self.logger.error(traceback.format_exc())
+            # Consider stopping or retrying based on the error
+            self.mw_obj.disable_event_loop() # Stop on error for now
+            return None
 
     def cleanup(self):
         """Clean up resources"""

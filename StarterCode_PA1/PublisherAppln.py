@@ -15,6 +15,7 @@ import sys
 import time
 import argparse
 import logging
+import random
 from kazoo.client import KazooClient
 from topic_selector import TopicSelector
 from CS6381_MW.PublisherMW import PublisherMW
@@ -36,6 +37,7 @@ class PublisherAppln:
         self.iters = None
         self.frequency = None
         self.num_topics = None
+        self.timeout = None
         self.mw_obj = None
         self.logger = logger
         self.zk = None
@@ -61,6 +63,7 @@ class PublisherAppln:
             self.iters = args.iters
             self.frequency = args.frequency
             self.num_topics = args.num_topics
+            self.timeout = 1000 / self.frequency # Calculate timeout in milliseconds
 
             self.logger.debug("PublisherAppln::configure - selecting topic list")
             ts = TopicSelector()
@@ -173,29 +176,25 @@ class PublisherAppln:
                 # Rest of the dissemination logic
                 self.logger.info("PublisherAppln::invoke_operation - Disseminating")
                 
-                # If we have iterations left, disseminate one batch of topics
-                if hasattr(self, 'current_iteration') and self.current_iteration < self.iters:
-                    ts = TopicSelector()
-                    for topic in self.topiclist:
-                        dissemination_data = ts.gen_publication(topic)
-                        self.mw_obj.disseminate(self.name, topic, dissemination_data)
+                # dissemination Message
+                try:
+                    # Select a random topic from the list
+                    topic = random.choice(self.topiclist)
+                    # Construct the dissemination data
+                    dissemination_data = f"value: {random.randint(1, 100)}" # Example data
                     
-                    self.current_iteration += 1
-                    self.logger.info(f"Published iteration {self.current_iteration}/{self.iters}")
+                    # Disseminate the data for the chosen topic
+                    # Corrected call: Removed self.name argument
+                    self.mw_obj.disseminate(topic, dissemination_data)
                     
-                    # Return a timeout based on the frequency (in milliseconds)
-                    return int(1000/float(self.frequency))
-
-                # If we're done with all iterations, complete
-                elif hasattr(self, 'current_iteration') and self.current_iteration >= self.iters:
-                    self.logger.info("PublisherAppln::invoke_operation - Dissemination completed")
-                    self.state = self.State.COMPLETED
-                    return 0
-                
-                # First call to disseminate, initialize the counter
-                else:
-                    self.current_iteration = 0
-                    return 0  # Call us right back to start the first iteration
+                    self.logger.info(f"Disseminated data for topic '{topic}'")
+                    
+                except Exception as e:
+                    self.logger.error(f"Exception in invoke_operation: {e}")
+                    raise e # Re-raise exception to be caught by the main loop
+                    
+                # Return the timeout for the next invocation
+                return self.timeout
 
             else:
                 self.logger.info("PublisherAppln::invoke_operation - Completed")
