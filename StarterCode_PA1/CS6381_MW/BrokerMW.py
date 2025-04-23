@@ -70,6 +70,11 @@ class BrokerMW():
             self.addr = args.addr  
             self.port = args.port
             
+            # Store group name from args if available
+            if hasattr(args, 'group'):
+                self.group_name = args.group
+                self.logger.info(f"BrokerMW::configure - Using group name: {self.group_name}")
+            
             # Initialize ZMQ sockets
             self.poller = zmq.Poller()
             
@@ -86,6 +91,13 @@ class BrokerMW():
             
             # Configure replication sockets based on primary status
             self._configure_replication()
+            
+            # Automatically look for and connect to load balancer if available
+            self._setup_lb_watch()
+            if self._find_and_connect_to_lb():
+                self.logger.info("BrokerMW::configure - Connected to load balancer automatically")
+            else:
+                self.logger.info("BrokerMW::configure - No load balancer found, operating in standalone mode")
             
             self.logger.info("BrokerMW::configure - Configuration complete")
             
@@ -705,4 +717,81 @@ class BrokerMW():
             return True
         except Exception as e:
             self.logger.error(f"BrokerMW::zk_delete_node - Error with {path}: {str(e)}")
+            return False
+
+    ########################################
+    # Setup Load Balancer Watch
+    ########################################
+    def _setup_lb_watch(self):
+        """Set up a watch for load balancer nodes in ZooKeeper"""
+        try:
+            # Make sure the path exists
+            lb_path = "/load_balancers"
+            if not self.zk.exists(lb_path):
+                self.logger.info(f"BrokerMW::_setup_lb_watch - Creating load balancer path in ZooKeeper: {lb_path}")
+                self.zk.ensure_path(lb_path)
+            
+            # Set up the watch function
+            @self.zk.ChildrenWatch(lb_path)
+            def watch_lb(children):
+                self.logger.info(f"BrokerMW::_setup_lb_watch - Load balancers changed: {children}")
+                if children and not self.using_lb:
+                    self.logger.info("BrokerMW::_setup_lb_watch - Load balancer detected after startup, attempting to connect")
+                    self._find_and_connect_to_lb()
+            
+            self.logger.info("BrokerMW::_setup_lb_watch - Set up watch for load balancers")
+            return True
+        except Exception as e:
+            self.logger.error(f"BrokerMW::_setup_lb_watch - Error setting up load balancer watch: {str(e)}")
+            return False
+            
+    ########################################
+    # Find and Connect to Load Balancer
+    ########################################
+    def _find_and_connect_to_lb(self):
+        """Find load balancer in ZooKeeper and connect to it"""
+        try:
+            lb_path = "/load_balancers"
+            if not self.zk.exists(lb_path):
+                self.logger.info("BrokerMW::_find_and_connect_to_lb - Load balancer path doesn't exist yet")
+                return False
+            
+            # Get list of load balancers
+            lb_nodes = self.zk.get_children(lb_path)
+            if not lb_nodes:
+                self.logger.info("BrokerMW::_find_and_connect_to_lb - No load balancer nodes found")
+                return False
+            
+            # Pick the first one
+            lb_node = lb_nodes[0]
+            lb_data_path = f"{lb_path}/{lb_node}"
+            
+            # Get load balancer connection info
+            if not self.zk.exists(lb_data_path):
+                self.logger.warning(f"BrokerMW::_find_and_connect_to_lb - Load balancer node {lb_node} disappeared")
+                return False
+                
+            lb_data, _ = self.zk.get(lb_data_path)
+            if not lb_data:
+                self.logger.warning("BrokerMW::_find_and_connect_to_lb - Load balancer data is empty")
+                return False
+                
+            # Parse connection info
+            lb_info = lb_data.decode().split(":")
+            if len(lb_info) < 3:
+                self.logger.error(f"BrokerMW::_find_and_connect_to_lb - Invalid load balancer data format: {lb_data.decode()}")
+                return False
+                
+            lb_addr, pub_port, sub_port = lb_info[0], lb_info[1], lb_info[2]
+            self.logger.info(f"BrokerMW::_find_and_connect_to_lb - Found load balancer at {lb_addr}:{pub_port}")
+            
+            # Connect to load balancer using the group name from args
+            group = self.group_name or "default_group"
+            result = self.connect_to_lb(lb_addr, int(pub_port), group)
+            
+            return result
+                
+        except Exception as e:
+            self.logger.error(f"BrokerMW::_find_and_connect_to_lb - Error finding/connecting to load balancer: {str(e)}")
+            self.logger.error(traceback.format_exc())
             return False
