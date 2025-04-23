@@ -15,6 +15,7 @@ import time
 import zmq
 import logging
 import traceback  # Added for better error logging
+from kazoo.protocol.states import KazooState  # For ZK session state listener
 from CS6381_MW import discovery_pb2
 
 # Constants for ZK paths (matching BrokerMW)
@@ -23,6 +24,7 @@ ZK_PUBLISHERS_PATH = "/publishers"
 ZK_BROKERS_PATH = "/brokers"
 ZK_SUBSCRIBERS_PATH = "/subscribers"
 ZK_LOAD_BALANCERS_PATH = "/load_balancers"
+ZK_OWNERSHIP_PATH = "/ownership"  # Base path for ownership strength coordination
 
 # Constants for ZMQ options
 ZMQ_PUB_HWM = 1000  # High Water Mark for PUB socket
@@ -32,6 +34,10 @@ ZMQ_REQ_RETRIES = 3  # Retries for REQ socket
 class PublisherMW:
     def __init__(self, logger):
         self.logger = logger
+        # Ownership strength tracking
+        self.ownership_nodes = {}      # topic -> own sequential node name
+        self.is_leader = {}            # topic -> bool leadership status
+        self.ownership_strength = {}    # topic -> current rank (1 is leader)
         self.context = None  # Initialize in configure
         self.req = None  # REQ socket for Discovery
         self.pub = None  # PUB socket for topic dissemination
@@ -52,18 +58,44 @@ class PublisherMW:
             "publishers": ZK_PUBLISHERS_PATH,
             "brokers": ZK_BROKERS_PATH,
             "subscribers": ZK_SUBSCRIBERS_PATH,
-            "load_balancers": ZK_LOAD_BALANCERS_PATH
+            "load_balancers": ZK_LOAD_BALANCERS_PATH,
+            "ownership": ZK_OWNERSHIP_PATH  # Path for ownership strength coordination
         }
 
     def configure(self, discovery_addr, port, ipaddr, zk_client=None):
         """Initialize ZMQ context, sockets, and poller."""
         try:
             self.logger.info("PublisherMW::configure")
+            # Ensure logger prints DEBUG messages for ownership QoS introspection
+            try:
+                self.logger.setLevel(logging.DEBUG)
+                for handler in self.logger.handlers:
+                    handler.setLevel(logging.DEBUG)
+            except Exception:
+                logging.getLogger().setLevel(logging.DEBUG)
 
             self.discovery_addr = discovery_addr
             self.port = port
             self.addr = ipaddr
             self.zk = zk_client  # Store ZooKeeper client reference if provided
+            # Ensure ownership base path exists in ZooKeeper
+            if self.zk:
+                self.zk.ensure_path(self.zk_paths['ownership'])
+                # Add listener for ZooKeeper session state changes to re-register ownership nodes on session loss
+                def _zk_state_listener(state):
+                    if state == KazooState.LOST:
+                        self.logger.warning("PublisherMW - ZooKeeper session lost. Re-registering ownership nodes")
+                        # Clear previous ownership nodes and statuses
+                        self.ownership_nodes.clear()
+                        self.is_leader.clear()
+                        self.ownership_strength.clear()
+                        # Recreate ownership nodes and watches for current topics
+                        self.register_ownership_strength(self.topics)
+                    elif state == KazooState.SUSPENDED:
+                        self.logger.warning("PublisherMW - ZooKeeper connection suspended")
+                    elif state == KazooState.CONNECTED:
+                        self.logger.info("PublisherMW - ZooKeeper reconnected")
+                self.zk.add_listener(_zk_state_listener)
 
             # Initialize ZMQ context
             self.context = zmq.Context()
@@ -102,6 +134,8 @@ class PublisherMW:
             # This makes the publisher discoverable via ZK immediately
             if self.zk:
                 self.register_in_zookeeper()  # Use stored info
+                # Setup ownership strength coordination in ZooKeeper
+                self.register_ownership_strength(topiclist)
 
             # Create discovery service registration request (protobuf)
             reg_info = discovery_pb2.RegistrantInfo()
@@ -314,6 +348,14 @@ class PublisherMW:
         # Data validation could be added here if needed
 
         try:
+            # Ownership strength: only leader for topic publishes
+            if self.zk and topic in self.ownership_nodes:
+                if not self.is_leader.get(topic, False):
+                    self.logger.debug(f"PublisherMW::disseminate - Not ownership leader for topic '{topic}', dropping message.")
+                    return False
+                else:
+                    strength = self.ownership_strength.get(topic)
+                    self.logger.debug(f"PublisherMW::disseminate - Ownership leader (strength={strength}) confirmed for topic '{topic}', sending message.")
             # Add timestamp for latency calculation
             timestamp = time.time()
             # Format message: "topic:timestamp:data"
@@ -337,6 +379,62 @@ class PublisherMW:
             self.logger.error(traceback.format_exc())
             # Consider if this should raise or just return False
             return False  # Return False on error
+
+    def register_ownership_strength(self, topics):
+        """Create ephemeral sequential nodes and watches for ownership strength per topic."""
+        for topic in topics:
+            try:
+                base = f"{self.zk_paths['ownership']}/{topic}"
+                # Ensure base path exists
+                self.zk.ensure_path(base)
+                # Create ephemeral sequential node for this publisher
+                node_path = self.zk.create(f"{base}/strength-", b"", ephemeral=True, sequence=True, makepath=True)
+                node_name = node_path.split('/')[-1]
+                self.ownership_nodes[topic] = node_name
+                self.ownership_strength[topic] = None  # will be set on first watch callback
+                self.logger.debug(f"PublisherMW::register_ownership_strength - Created strength node '{node_name}' for topic '{topic}' at path '{node_path}'")
+                # Initialize leadership status
+                self.is_leader[topic] = False
+                # Watch for ownership changes
+                @self.zk.ChildrenWatch(base)
+                def watch_children(children, topic=topic):
+                    self._handle_ownership_change(topic, children)
+                # Perform initial fetch of children to set initial leadership status before event loop
+                try:
+                    initial_children = self.zk.get_children(base)
+                    self._handle_ownership_change(topic, initial_children)
+                except Exception as e:
+                    self.logger.error(f"PublisherMW::register_ownership_strength - Failed initial children fetch for topic '{topic}': {e}")
+            except Exception as e:
+                self.logger.error(f"PublisherMW::register_ownership_strength - Error for topic '{topic}': {e}")
+
+    def _handle_ownership_change(self, topic, children):
+        """Determine ownership leader for a topic based on smallest sequential node."""
+        try:
+            if not children:
+                return
+            self.logger.debug(f"PublisherMW::_handle_ownership_change - Children before sort for topic '{topic}': {children}")
+            sorted_nodes = sorted(children)
+            leader = sorted_nodes[0]
+            # Compute strength rank (1-based index in sorted list)
+            my_node = self.ownership_nodes.get(topic)
+            if my_node in sorted_nodes:
+                rank = sorted_nodes.index(my_node) + 1
+                self.ownership_strength[topic] = rank
+            else:
+                rank = None
+                self.ownership_strength[topic] = None
+            self.logger.debug(f"PublisherMW::_handle_ownership_change - Sorted nodes for topic '{topic}': {sorted_nodes}, my_node: {my_node}, rank: {rank}, leader: {leader}")
+            prev = self.is_leader.get(topic, False)
+            curr = (leader == self.ownership_nodes.get(topic))
+            if curr != prev:
+                self.is_leader[topic] = curr
+                if curr:
+                    self.logger.info(f"PublisherMW - Gained ownership for topic '{topic}'")
+                else:
+                    self.logger.info(f"PublisherMW - Lost ownership for topic '{topic}'")
+        except Exception as e:
+            self.logger.error(f"PublisherMW::_handle_ownership_change - {e}")
 
     def set_upcall_handle(self, upcall_obj):
         """Set the upcall object for application callbacks."""

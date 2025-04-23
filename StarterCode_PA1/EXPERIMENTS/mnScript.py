@@ -41,11 +41,11 @@ def run():
         brokers_group2.append(net.addHost(f'brk2_{i+1}'))  # Broker group 2
     
     publishers = []
-    for i in range(3):
+    for i in range(5):
         publishers.append(net.addHost(f'pub{i+1}'))  # Publishers
     
     subscribers = []
-    for i in range(3):
+    for i in range(5):
         subscribers.append(net.addHost(f'sub{i+1}'))  # Subscribers
     
     # Monitor host (for watching and killing processes to test failover)
