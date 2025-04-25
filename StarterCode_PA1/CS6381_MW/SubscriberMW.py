@@ -469,14 +469,20 @@ class SubscriberMW:
             time_received = time.time()
 
             try:
-                topic, time_sent_str, content = message.split(":", 2)
+                topic, time_sent_str, deadline_str, content = message.split(":", 3)
                 time_sent = float(time_sent_str)
+                deadline = float(deadline_str)
                 latency = time_received - time_sent
 
                 # classify msg with latency>0.5 as history msg
                 is_replay = latency > 0.5
                 tag = "[REPLAY]" if is_replay else "[LIVE]"
-                self.logger.info(f"{tag} Message on topic '{topic}' with latency {latency:.3f}s: {content[:50]}")
+                # Deadline violation check
+                missed_deadline = time_received > deadline
+                deadline_tag = "[DEADLINE-MISS]" if missed_deadline else "[ONTIME]"
+
+                # Combined log
+                self.logger.info(f"{tag} {deadline_tag} Message on topic '{topic}' with latency {latency:.3f}s: {content[:50]}")
 
             except ValueError as e:
                 self.logger.error(f"Could not parse received message: '{message[:100]}...' - Error: {e}")

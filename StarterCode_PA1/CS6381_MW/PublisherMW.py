@@ -387,8 +387,9 @@ class PublisherMW:
                     self.logger.debug(f"PublisherMW::disseminate - Ownership leader (strength={strength}) confirmed for topic '{topic}', sending message.")
             # Add timestamp for latency calculation
             timestamp = time.time()
+            deadline = timestamp + 0.5
             # Format message: "topic:timestamp:data"
-            send_str = f"{topic}:{timestamp}:{data}"
+            send_str = f"{topic}:{timestamp}:{deadline}:{data}"
             self.logger.debug(f"PublisherMW::disseminate - Publishing on topic '{topic}': {send_str[:100]}...")  # Log snippet
 
             # Send the message as bytes, using NOBLOCK for safety with HWM
@@ -552,7 +553,8 @@ class PublisherMW:
 
             for topic, buffer in self.history_buffer.items():
                 for timestamp, data in buffer:
-                    send_str = f"{topic}:{timestamp}:{data}:H"
+                    deadline = timestamp + 0.5  
+                    send_str = f"{topic}:{timestamp}:{deadline}:{data}"
                     try:
                         self.pub.send(bytes(send_str, "utf-8"), zmq.NOBLOCK)
                         self.logger.debug(f"Replayed history message for topic '{topic}': {send_str[:100]}...")
