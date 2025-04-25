@@ -21,7 +21,7 @@ def run():
     print("Adding controller")
     c0 = net.addController('c0')
 
-    zk_path = "/opt/zookeeper/bin"
+    zk_path = "/home/haonan/Downloads/apache-zookeeper-3.8.4-bin/bin"
     
     # Create hosts with descriptive names
     print("Creating hosts")
@@ -129,7 +129,7 @@ def run():
         broker.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg orange -fg black -hold -e "python3 BrokerAppln.py -n broker2_{i+1} -p {port} --addr {ip} -z {zk_ip}:2181 -g group2 -l 20" &')
         time.sleep(1)  # Give each broker time to initialize
 
-    # Wait for brokers to fully initialize and register with ZooKeeper
+    # # Wait for brokers to fully initialize and register with ZooKeeper
     print("\nWaiting for broker groups to initialize in ZooKeeper...")
     time.sleep(5)
 
@@ -150,6 +150,9 @@ def run():
 
     # Start Subscribers - cyan background
     print("\nStarting Subscribers...")
+
+    # wait 10 sec after starting publisher
+    time.sleep(10)
     for i, (sub, ip) in enumerate(zip(subscribers, subscriber_ips)):
         title = f"Subscriber {i+1} ({ip})"
         sub.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg cyan -fg black -hold -e "python3 SubscriberAppln.py -n sub{i+1} -z {zk_ip}:2181 -T 9 -l 20" &')

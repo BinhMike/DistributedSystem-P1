@@ -472,7 +472,11 @@ class SubscriberMW:
                 topic, time_sent_str, content = message.split(":", 2)
                 time_sent = float(time_sent_str)
                 latency = time_received - time_sent
-                self.logger.debug(f"Received message on topic '{topic}', latency: {latency:.6f}s")
+
+                is_replay = latency > 0.5
+                tag = "[REPLAY]" if is_replay else "[LIVE]"
+                self.logger.info(f"{tag} Message on topic '{topic}' with latency {latency:.3f}s: {content[:50]}")
+
             except ValueError as e:
                 self.logger.error(f"Could not parse received message: '{message[:100]}...' - Error: {e}")
                 return

@@ -17,6 +17,9 @@ import logging
 import traceback  # Added for better error logging
 from kazoo.protocol.states import KazooState  # For ZK session state listener
 from CS6381_MW import discovery_pb2
+from collections import deque
+import threading
+
 
 # Constants for ZK paths (matching BrokerMW)
 ZK_DISCOVERY_LEADER_PATH = "/discovery/leader"
@@ -51,6 +54,11 @@ class PublisherMW:
         self.port = None  # Store publisher port
         self.topics = []  # List of topics we publish
         self.group_mapping = {}  # Topic to virtual group mapping
+        self.history_length = {}  # topic -> number of samples to retain
+        self.history_buffer = {}
+        self.last_replay_index = {}  # topic -> last replayed index
+
+
 
         # Paths for ZooKeeper structure using constants
         self.zk_paths = {
@@ -118,6 +126,15 @@ class PublisherMW:
 
             self.logger.info(f"PublisherMW::configure - PUB socket bound to tcp://*:{self.port}, REQ connected to {self.discovery_addr}")
 
+            def _periodic_replay():
+                while self.handle_events:
+                    self.replay_history()
+                    time.sleep(5)  # repeat every 5 sec
+
+            replay_thread = threading.Thread(target=_periodic_replay, daemon=True)
+            replay_thread.start()
+            self.logger.info("PublisherMW::configure - Started periodic history replay thread")
+
         except Exception as e:
             self.logger.error(f"PublisherMW::configure - Error: {str(e)}")
             self.logger.error(traceback.format_exc())  # Log full traceback
@@ -129,6 +146,10 @@ class PublisherMW:
             self.logger.info(f"PublisherMW::register - Registering '{name}' for topics: {topiclist}")
             self.pub_name = name  # Store publisher name
             self.topics = topiclist  # Store topics
+
+            for topic in topiclist:
+                self.history_length[topic] = 15 
+
 
             # Register directly in ZooKeeper first (if available)
             # This makes the publisher discoverable via ZK immediately
@@ -203,9 +224,12 @@ class PublisherMW:
             # Create or update the publisher's node with its info
             pub_node = f"{pub_path}/{self.pub_name}"
 
-            # Include topic-group mapping if available
-            if self.group_mapping:
-                mapping_str = ",".join([f"{t}:{self.group_mapping[t]}" for t in self.group_mapping])
+            # Include topic-group-history mapping if available
+            if self.group_mapping and self.history_length:
+                mapping_str = ",".join([
+                    f"{t}:{self.group_mapping.get(t, 0)}.{self.history_length.get(t, 0)}"
+                    for t in self.topics
+                ])
                 node_data = f"{self.addr}:{self.port}|{mapping_str}"
             else:
                 # Just include address:port if no mapping is available yet
@@ -348,6 +372,12 @@ class PublisherMW:
         # Data validation could be added here if needed
 
         try:
+            # store message
+            if topic not in self.history_buffer:
+                maxlen = self.history_length.get(topic, 0)
+                self.history_buffer[topic] = deque(maxlen=maxlen)
+            self.history_buffer[topic].append((time.time(), data))
+            
             # Ownership strength: only leader for topic publishes
             if self.zk and topic in self.ownership_nodes:
                 if not self.is_leader.get(topic, False):
@@ -514,4 +544,33 @@ class PublisherMW:
 
         except Exception as e:
             self.logger.error(f"PublisherMW::cleanup - Error during cleanup: {str(e)}")
+            self.logger.error(traceback.format_exc())
+
+    def replay_history(self):
+        """Replay new history messages once per topic"""
+        try:
+            self.logger.info("PublisherMW::replay_history - Replaying new history to connected subscribers")
+
+            for topic, buffer in self.history_buffer.items():
+                # Determine where to resume from
+                last_index = self.last_replay_index.get(topic, 0)
+                new_messages = list(buffer)[last_index:]
+
+                if not new_messages:
+                    self.logger.debug(f"No new messages to replay for topic '{topic}'")
+                    continue
+
+                for timestamp, data in new_messages:
+                    send_str = f"{topic}:{timestamp}:{data}:H"
+                    try:
+                        self.pub.send(bytes(send_str, "utf-8"), zmq.NOBLOCK)
+                        self.logger.debug(f"Replayed message for topic '{topic}': {send_str[:100]}...")
+                    except zmq.error.Again:
+                        self.logger.warning(f"PublisherMW::replay_history - Failed to send replay message on topic '{topic}'")
+
+                # Update last replay index
+                self.last_replay_index[topic] = len(buffer)
+
+        except Exception as e:
+            self.logger.error(f"PublisherMW::replay_history - Error: {str(e)}")
             self.logger.error(traceback.format_exc())

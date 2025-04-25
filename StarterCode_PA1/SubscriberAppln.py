@@ -29,6 +29,8 @@ class SubscriberAppln:
         self.state = self.State.INITIALIZE  # Initialize state
         self.received_count = 0  # Track received messages
         self.iters = 0  # Number of messages to receive (0 for infinite)
+        self.requested_history = {}  # topic -> required history length
+
 
         # ZooKeeper paths
         self.zk_paths = {
@@ -56,6 +58,10 @@ class SubscriberAppln:
         ts = TopicSelector()
         self.topiclist = ts.interest(args.num_topics)  # Get random topics
         self.logger.info(f"SubscriberAppln:: Selected topics: {self.topiclist}")
+        
+        for t in self.topiclist:
+            self.requested_history[t] = 20
+        self.logger.info(f"SubscriberAppln:: Requested history: {self.requested_history}")
 
         # Initialize middleware first before setting ZooKeeper watch
         self.mw_obj = SubscriberMW(self.logger)
@@ -208,6 +214,30 @@ class SubscriberAppln:
 
             else: # Direct Publisher mode
                 self.logger.info(f"Direct Publisher mode detected with {len(lookup_resp.publishers)} publishers found.")
+                filtered_publishers = []
+                for pub_info in lookup_resp.publishers:
+                    try:
+                        if "|" not in pub_info.id:
+                            continue
+                        pub_id, metadata = pub_info.id.split("|", 1)
+                        topics = metadata.split(",")
+                        history_ok = True
+                        for item in topics:
+                            if ":" in item:
+                                topic, grp_hist = item.split(":")
+                                if "." in grp_hist:
+                                    _, hist = grp_hist.split(".")
+                                    required = self.requested_history.get(topic.strip(), 0)
+                                    if int(hist) < required:
+                                        self.logger.info(f"Skipping publisher {pub_id} - insufficient history for topic '{topic}'")
+                                        history_ok = False
+                                        break
+                        if history_ok:
+                            filtered_publishers.append(pub_info)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to parse publisher metadata: {e}")
+
+
                 connected_count = 0
                 for pub_info in lookup_resp.publishers:
                     pub_addr = f"{pub_info.addr}:{pub_info.port}"
