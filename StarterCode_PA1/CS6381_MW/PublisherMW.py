@@ -56,8 +56,7 @@ class PublisherMW:
         self.group_mapping = {}  # Topic to virtual group mapping
         self.history_length = {}  # topic -> number of samples to retain
         self.history_buffer = {}
-        self.last_replay_index = {}  # topic -> last replayed index
-
+        
 
 
         # Paths for ZooKeeper structure using constants
@@ -547,30 +546,18 @@ class PublisherMW:
             self.logger.error(traceback.format_exc())
 
     def replay_history(self):
-        """Replay new history messages once per topic"""
+        """Replay the latest N history messages for each topic"""
         try:
-            self.logger.info("PublisherMW::replay_history - Replaying new history to connected subscribers")
+            self.logger.info("PublisherMW::replay_history - Replaying history to connected subscribers")
 
             for topic, buffer in self.history_buffer.items():
-                # Determine where to resume from
-                last_index = self.last_replay_index.get(topic, 0)
-                new_messages = list(buffer)[last_index:]
-
-                if not new_messages:
-                    self.logger.debug(f"No new messages to replay for topic '{topic}'")
-                    continue
-
-                for timestamp, data in new_messages:
+                for timestamp, data in buffer:
                     send_str = f"{topic}:{timestamp}:{data}:H"
                     try:
                         self.pub.send(bytes(send_str, "utf-8"), zmq.NOBLOCK)
-                        self.logger.debug(f"Replayed message for topic '{topic}': {send_str[:100]}...")
+                        self.logger.debug(f"Replayed history message for topic '{topic}': {send_str[:100]}...")
                     except zmq.error.Again:
-                        self.logger.warning(f"PublisherMW::replay_history - Failed to send replay message on topic '{topic}'")
-
-                # Update last replay index
-                self.last_replay_index[topic] = len(buffer)
-
+                        self.logger.warning(f"PublisherMW::replay_history - Failed to send history message for topic '{topic}'")
         except Exception as e:
-            self.logger.error(f"PublisherMW::replay_history - Error: {str(e)}")
+            self.logger.error(f"PublisherMW::replay_history - Error during replay: {str(e)}")
             self.logger.error(traceback.format_exc())

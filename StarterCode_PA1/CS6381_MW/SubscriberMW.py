@@ -473,6 +473,7 @@ class SubscriberMW:
                 time_sent = float(time_sent_str)
                 latency = time_received - time_sent
 
+                # classify msg with latency>0.5 as history msg
                 is_replay = latency > 0.5
                 tag = "[REPLAY]" if is_replay else "[LIVE]"
                 self.logger.info(f"{tag} Message on topic '{topic}' with latency {latency:.3f}s: {content[:50]}")
