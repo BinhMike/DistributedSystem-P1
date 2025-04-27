@@ -21,7 +21,7 @@ def run():
     print("Adding controller")
     c0 = net.addController('c0')
 
-    zk_path = "/opt/zookeeper/bin"
+    zk_path = "/home/haonan/Downloads/apache-zookeeper-3.8.4-bin/bin"
     
     # Create hosts with descriptive names
     print("Creating hosts")
@@ -41,11 +41,11 @@ def run():
         brokers_group2.append(net.addHost(f'brk2_{i+1}'))  # Broker group 2
     
     publishers = []
-    for i in range(3):
+    for i in range(5):
         publishers.append(net.addHost(f'pub{i+1}'))  # Publishers
     
     subscribers = []
-    for i in range(3):
+    for i in range(5):
         subscribers.append(net.addHost(f'sub{i+1}'))  # Subscribers
     
     # Monitor host (for watching and killing processes to test failover)
@@ -129,7 +129,7 @@ def run():
         broker.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg orange -fg black -hold -e "python3 BrokerAppln.py -n broker2_{i+1} -p {port} --addr {ip} -z {zk_ip}:2181 -g group2 -l 20" &')
         time.sleep(1)  # Give each broker time to initialize
 
-    # Wait for brokers to fully initialize and register with ZooKeeper
+    # # Wait for brokers to fully initialize and register with ZooKeeper
     print("\nWaiting for broker groups to initialize in ZooKeeper...")
     time.sleep(5)
 
@@ -150,6 +150,9 @@ def run():
 
     # Start Subscribers - cyan background
     print("\nStarting Subscribers...")
+
+    # wait 10 sec after starting publisher
+    time.sleep(10)
     for i, (sub, ip) in enumerate(zip(subscribers, subscriber_ips)):
         title = f"Subscriber {i+1} ({ip})"
         sub.cmd(f'xterm -T "{title}" -fa "Monospace" -fs 12 -geometry 100x30 -bg cyan -fg black -hold -e "python3 SubscriberAppln.py -n sub{i+1} -z {zk_ip}:2181 -T 9 -l 20" &')
@@ -180,51 +183,37 @@ def run():
     # Cleanup process
     print("\nShutting down the test environment...")
     
-    # Define process kill procedure with improved cleanup
     def cleanup_processes():
-        # Define hosts to clean up
         hosts_to_clean = all_hosts
-        
         print("Killing all application processes...")
-        
-        # First, try a graceful shutdown with SIGINT and a short timeout
+
+        # Graceful shutdown
         for host in hosts_to_clean:
-            # Use specific patterns to target exact processes
-            host.cmd("pkill -INT -f '[D]iscoveryAppln'")  # The bracketed first letter prevents matching the pkill command itself
+            host.cmd("pkill -INT -f '[D]iscoveryAppln'")
             host.cmd("pkill -INT -f '[B]rokerAppln'")
             host.cmd("pkill -INT -f '[B]rokerLB'")
             host.cmd("pkill -INT -f '[P]ublisherAppln'")
             host.cmd("pkill -INT -f '[S]ubscriberAppln'")
-        
-        # Give processes a moment to shut down gracefully
+
         print("Waiting for processes to shut down gracefully...")
         time.sleep(3)
-        
-        # Now forcefully kill any remaining processes
+
+        # Force kill only your application processes
         for host in hosts_to_clean:
-            # Force kill any remaining Python processes
             host.cmd("pkill -9 -f '[Pp]ython3 .*DiscoveryAppln'")
             host.cmd("pkill -9 -f '[Pp]ython3 .*BrokerAppln'")
             host.cmd("pkill -9 -f '[Pp]ython3 .*BrokerLB'")
             host.cmd("pkill -9 -f '[Pp]ython3 .*PublisherAppln'")
             host.cmd("pkill -9 -f '[Pp]ython3 .*SubscriberAppln'")
-            
-            # Kill any xterm windows
-            host.cmd("pkill -9 -f 'xterm'")
-            
-        # Stop ZooKeeper with a timeout
+            # DO NOT kill all xterms or shells
+
+        # Stop ZooKeeper
         print("Stopping ZooKeeper...")
         zk_host.cmd(f"{zk_path}/zkServer.sh stop")
-        time.sleep(2)  # Give ZooKeeper time to stop
-        
-        # Force kill ZooKeeper if it's still running
+        time.sleep(2)
         zk_host.cmd("pkill -9 -f '[Zz]ooKeeper'")
-        
-        # Verify all processes are dead
-        for host in hosts_to_clean:
-            host.cmd("pkill -0 -f 'python3' || echo 'All Python processes stopped'")
-        
-        print("All processes terminated")
+
+        print("All application processes terminated")
     
     # Run cleanup with a timeout to avoid hanging
     import threading
